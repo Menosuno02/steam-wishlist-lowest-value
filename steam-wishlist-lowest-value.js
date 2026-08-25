@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Steam Wishlist Lowest Value
 // @namespace    http://tampermonkey.net/
-// @version      3.3
-// @description  Shows the total minimum price of your wishlist: compares the price shown by Steam (incl. bundle pricing: each wishlist panel shows your real price, own discount + bundle discount) with AllKeyShop's price (queried directly from its API) and adds it next to the Augmented Steam stats. The wishlist comes from the official Steam API; prices are captured by auto-sweeping the virtualized list (aborts if you scroll); DOM scraping is the fallback when the API fails (private wishlist, timeout, etc.).
+// @version      3.11
+// @description  Shows three totals for your wishlist in Steam's native controls bar: minimum value (Steam's real prices, incl. bundle pricing, compared with AllKeyShop's lowest offer, queried directly from its API), current value (Steam's own prices with the discounts/bundles visible in the wishlist) and original value (sum of pre-discount Steam prices), plus wishlist stats (total, on sale, without price). The wishlist comes from the official Steam API; prices are captured by auto-sweeping the virtualized list (aborts if you scroll); DOM scraping is the fallback when the API fails (private wishlist, timeout, etc.).
 // @author       Menosuno02
 // @match        https://store.steampowered.com/wishlist/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=steampowered.com
@@ -47,7 +47,7 @@
 
     // Delay between AllKeyShop API calls (undocumented endpoint; raise if
     // blocked, lower if in a hurry).
-    const AKS_REQUEST_DELAY_MS = 100;
+    const AKS_REQUEST_DELAY_MS = 45;
     // Failed requests retry sooner (5 min) — likely a temporary block.
     const AKS_ERROR_RETRY_MS = 5 * 60 * 1000; // 5 min
     const AKS_API_URL =
@@ -72,6 +72,21 @@
     const pendingNameFetch = new Set();
     const nameQueue = [];
     let nameQueueActive = 0;
+
+    // ---------- Diagnostics ----------
+    // All diagnostic output uses the [WMP] prefix so it can be filtered in
+    // the console. domSnapshot is session-only and never persisted: what
+    // each scanned panel actually rendered (price tag, discount badge) —
+    // the same ground truth AugmentedSteam counts from.
+    const SCRIPT_VERSION =
+        typeof GM_info !== "undefined" && GM_info.script
+            ? GM_info.script.version
+            : "?";
+    const domSnapshot = new Map(); // appid -> { tag, badge, seen }
+    let verboseCapture = false;
+    function log(...args) {
+        console.log("[WMP]", ...args);
+    }
 
     // ---------- Cache loading ----------
     // Cache per steamid when known (independent of the exact URL); by
@@ -110,8 +125,9 @@
         aksQueue.length = 0;
         pendingNameFetch.clear();
         nameQueue.length = 0;
+        domSnapshot.clear();
         persistStore();
-        console.log("[WishlistMinPrice] Prices cleared (names kept)");
+        log(`resetCache: cleared entries (names kept, key=${storageKey}, left=${Object.keys(store).length})`);
 
         const steamid = resolveSteamId();
         if (steamid) {
@@ -133,6 +149,13 @@
             appid,
             name: v.name || "(no name)",
             steamPrice: typeof v.steamPrice === "number" ? v.steamPrice : null,
+            steamOriginal:
+                typeof v.steamOriginalPrice === "number"
+                    ? v.steamOriginalPrice
+                    : null,
+            discount:
+                typeof v.discountPercent === "number" ? v.discountPercent : null,
+            noPrice: v.noPrice === true,
             aksPrice: typeof v.aksPrice === "number" ? v.aksPrice : null,
             price: typeof v.price === "number" ? v.price : null,
             ts: v.ts ? new Date(v.ts).toLocaleString() : null,
@@ -174,6 +197,195 @@
             })),
         );
         return extras;
+    };
+
+    // Diagnostics: bar counts and full cache dump (also returned as array).
+    unsafeWindow.__wishlistMinPriceDump = function () {
+        const counts = computeTotals();
+        const gameTotal =
+            apiWishlistTotal !== null ? apiWishlistTotal : counts.storeSize;
+        log(
+            `BAR COUNTS → on sale: ${counts.onSaleCount}, without price: ${counts.noPriceCount}, on wishlist: ${gameTotal} (fresh: ${counts.freshCount}, min: ${formatPrice(counts.total)}, current: ${formatPrice(counts.currentTotal)}, original: ${formatPrice(counts.originalTotal)})`,
+        );
+        const rows = Object.entries(store).map(([appid, v]) => ({
+            appid,
+            name: v.name || "(no name)",
+            steamPrice: typeof v.steamPrice === "number" ? v.steamPrice : null,
+            steamOriginal:
+                typeof v.steamOriginalPrice === "number" ? v.steamOriginalPrice : null,
+            discount: typeof v.discountPercent === "number" ? v.discountPercent : null,
+            noPrice: v.noPrice === true,
+            aksPrice: typeof v.aksPrice === "number" ? v.aksPrice : null,
+            price: typeof v.price === "number" ? v.price : null,
+        }));
+        console.table(rows);
+        log(`dump: ${rows.length} cache entries (returned as array)`);
+        return rows;
+    };
+
+    // Diagnostics: what the panels actually rendered this session — the
+    // same ground truth AugmentedSteam counts its stats from.
+    unsafeWindow.__wishlistMinPriceDom = function () {
+        if (domSnapshot.size === 0) {
+            log("dom: snapshot empty — reload the wishlist and let the sweep finish");
+            return null;
+        }
+        let withTag = 0;
+        let withBadge = 0;
+        let withoutTag = 0;
+        const diffs = [];
+        domSnapshot.forEach((snap, appid) => {
+            if (snap.tag !== null) withTag++;
+            else withoutTag++;
+            if (snap.badge !== null && snap.badge > 0) withBadge++;
+            const cache = store[appid] || {};
+            const label = `"${cache.name || appid}"`;
+            if (snap.tag === null && typeof cache.steamPrice === "number") {
+                diffs.push(
+                    `PHANTOM PRICE? ${appid} ${label} — cache steamPrice=${cache.steamPrice} but panel never showed a price tag (seen ${snap.seen}x)`,
+                );
+            }
+            if (
+                snap.badge !== null &&
+                snap.badge > 0 &&
+                cache.discountPercent !== snap.badge
+            ) {
+                diffs.push(
+                    `BADGE MISMATCH ${appid} ${label} — panel=-${snap.badge}% but cache discountPercent=${cache.discountPercent ?? "none"}`,
+                );
+            }
+            if (
+                snap.tag !== null &&
+                (snap.badge === null || snap.badge === 0) &&
+                typeof cache.discountPercent === "number" &&
+                cache.discountPercent > 0
+            ) {
+                diffs.push(
+                    `STALE SALE? ${appid} ${label} — cache discountPercent=${cache.discountPercent}% but panel showed no badge (seen ${snap.seen}x)`,
+                );
+            }
+        });
+        log(
+            `DOM SUMMARY (panels seen: ${domSnapshot.size}) → with price tag: ${withTag}, with badge: ${withBadge}, without tag: ${withoutTag} ← compare with AugmentedSteam (36 / 15)`,
+        );
+        if (diffs.length === 0) {
+            log("dom vs cache: no discrepancies");
+        } else {
+            log(`dom vs cache: ${diffs.length} discrepancies`);
+            diffs.forEach((d) => log("DOM DIFF →", d));
+        }
+        const rows = Array.from(domSnapshot.entries()).map(([appid, s]) => ({
+            appid,
+            tag: s.tag,
+            badge: s.badge,
+            seen: s.seen,
+        }));
+        console.table(rows);
+        return rows;
+    };
+
+    // Diagnostics: toggle per-panel capture spam. Calls log() only when on.
+    unsafeWindow.__wishlistMinPriceVerbose = function (on = true) {
+        verboseCapture = Boolean(on);
+        log(`verbose capture ${verboseCapture ? "ON" : "OFF"}`);
+    };
+
+    // Diagnostics (manual): compares our cache against the legacy
+    // wishlistdata endpoint (what the old wishlist — and likely
+    // AugmentedSteam — historically used). Never runs on its own.
+    unsafeWindow.__wishlistMinPriceCompare = async function () {
+        const steamid = resolveSteamId();
+        if (!steamid) {
+            log("compare: could not resolve a steamid");
+            return null;
+        }
+        log("compare: fetching wishlistdata for", steamid);
+        const fetchPage = (page) =>
+            new Promise((resolve) => {
+                const suffix = page === 0 ? "" : `?p=${page}`;
+                GM_xmlhttpRequest({
+                    method: "GET",
+                    timeout: STEAM_TIMEOUT_MS,
+                    url:
+                        `https://store.steampowered.com/wishlist/profiles/${steamid}` +
+                        `/wishlistdata/${suffix}`,
+                    onload: (res) => {
+                        try {
+                            resolve(JSON.parse(res.responseText));
+                        } catch (e) {
+                            log(`compare: page ${page} returned non-JSON`);
+                            resolve(null);
+                        }
+                    },
+                    onerror: () => {
+                        log(`compare: page ${page} network error`);
+                        resolve(null);
+                    },
+                    ontimeout: () => {
+                        log(`compare: page ${page} timed out`);
+                        resolve(null);
+                    },
+                });
+            });
+        const merged = {};
+        for (let page = 0; page < 10; page++) {
+            const data = await fetchPage(page);
+            if (!data) break;
+            const keys = Object.keys(data).filter((k) => /^\d+$/.test(k));
+            log(`compare: page ${page} → ${keys.length} items`);
+            if (keys.length === 0) break;
+            keys.forEach((k) => {
+                merged[k] = data[k];
+            });
+        }
+        const appids = Object.keys(merged);
+        if (appids.length === 0) {
+            log("compare: got no appid-keyed data — raw sample:");
+            console.log("[WMP] raw sample:", merged);
+            return null;
+        }
+        log("compare: sample entry →", JSON.stringify(merged[appids[0]]));
+        let wdSale = 0;
+        let wdNoPrice = 0;
+        const diffs = [];
+        appids.forEach((appid) => {
+            const wd = merged[appid] || {};
+            const wdDiscount =
+                typeof wd.discount_percent === "number" ? wd.discount_percent : null;
+            const priceMap = wd.price && typeof wd.price === "object" ? wd.price : null;
+            const hasPrice =
+                wd.is_free_game === true ||
+                (priceMap !== null && Object.keys(priceMap).length > 0);
+            if (wdDiscount !== null && wdDiscount > 0) wdSale++;
+            if (!hasPrice) wdNoPrice++;
+            const cache = store[appid];
+            const label = `"${(cache && cache.name) || wd.name || appid}"`;
+            if (!cache) {
+                diffs.push(`NOT IN CACHE ${appid} ${label}`);
+                return;
+            }
+            const cacheSale = (cache.discountPercent ?? 0) > 0;
+            if (((wdDiscount ?? 0) > 0) !== cacheSale) {
+                diffs.push(
+                    `SALE DIFF ${appid} ${label} — wishlistdata=${wdDiscount ?? "?"}% cache discountPercent=${cache.discountPercent ?? "none"}`,
+                );
+            }
+            const cachePriced = typeof cache.steamPrice === "number";
+            if (hasPrice !== cachePriced) {
+                diffs.push(
+                    `PRICE PRESENCE DIFF ${appid} ${label} — wishlistdata hasPrice=${hasPrice} cache steamPrice=${cachePriced ? cache.steamPrice : "none"}`,
+                );
+            }
+        });
+        log(
+            `compare: wishlistdata counts → on sale: ${wdSale}, without price: ${wdNoPrice}, items: ${appids.length} ← if this is 36/15, this is the source AS uses`,
+        );
+        if (diffs.length === 0) log("compare: no differences vs cache");
+        else {
+            log(`compare: ${diffs.length} differences vs cache`);
+            diffs.forEach((d) => log("COMPARE DIFF →", d));
+        }
+        return merged;
     };
 
     // ---------- Parseo / formato de precios ----------
@@ -271,9 +483,64 @@
         };
     }
 
-    function extractSteamPrice(panel) {
-        const el = panel.querySelector(".-OkCLv-56oQ- .-HQzBzl6lqI-");
-        return el ? parsePrice(el.textContent) : null;
+    // Price tag of a wishlist panel: on-sale games show the struck-through
+    // original next to the discounted price ("11,79€ 10,02€"), the rest a
+    // single value. Class names are hashed, so the primary path just parses
+    // every element inside the known price-tag container (max = original,
+    // min = discounted; duplicates from wrappers are harmless); the
+    // fallback groups leaf nodes holding a currency amount by parent when
+    // Valve renames those classes.
+    function buildSteamPrices(values) {
+        if (values.length === 0) return { original: null, discounted: null };
+        if (values.length === 1) {
+            return { original: values[0], discounted: values[0] };
+        }
+        return {
+            original: Math.max(...values),
+            discounted: Math.min(...values),
+        };
+    }
+
+    function extractSteamPrices(panel) {
+        const tag = panel.querySelector(".-OkCLv-56oQ-");
+        if (tag) {
+            const values = Array.from(tag.querySelectorAll("*"))
+                .map((el) => parsePrice(el.textContent))
+                .filter((v) => v !== null);
+            if (values.length > 0) return buildSteamPrices(values);
+        }
+
+        // Fallback: leaf divs showing an amount, grouped by their parent,
+        // so stray amounts elsewhere in the panel don't mix in.
+        const groups = new Map();
+        panel.querySelectorAll("div").forEach((el) => {
+            if (el.children.length > 0) return;
+            if (!el.textContent.includes(currencySymbol)) return;
+            const value = parsePrice(el.textContent);
+            if (value === null) return;
+            const parent = el.parentElement;
+            if (!groups.has(parent)) groups.set(parent, []);
+            groups.get(parent).push(value);
+        });
+        for (const values of groups.values()) {
+            if (values.length > 0) return buildSteamPrices(values);
+        }
+        return { original: null, discounted: null };
+    }
+
+    function extractDiscountPercent(panel) {
+        // Sale badge text like "-66%" lives in its own leaf div near the
+        // price tag. Search leaf nodes to avoid matching unrelated text.
+        let found = null;
+        panel.querySelectorAll("div, span").forEach((el) => {
+            if (el.children.length > 0) return;
+            const text = el.textContent.trim();
+            const m = text.match(/^-\s*(\d+)\s*%$/);
+            if (!m) return;
+            const n = parseInt(m[1], 10);
+            if (!isNaN(n) && n > 0 && n < 100) found = n;
+        });
+        return found;
     }
 
     // Loose name match so the API's "most relevant" result can't pass off
@@ -326,8 +593,11 @@
         return overlap / shorter.length >= 0.7;
     }
 
-    // Merge known data with the new price and recompute the minimum.
-    function updateGamePrice(appid, { steamPrice, aksPrice, name } = {}) {
+    // Merge known data with the new prices and recompute the minimum.
+    function updateGamePrice(
+        appid,
+        { steamPrice, steamOriginalPrice, discountPercent, aksPrice, name } = {},
+    ) {
         const existing = store[appid] || {};
         const merged = { ...existing };
         let changed = false;
@@ -335,6 +605,15 @@
         if (steamPrice !== undefined) {
             changed = existing.steamPrice !== steamPrice || changed;
             merged.steamPrice = steamPrice;
+        }
+        if (steamOriginalPrice !== undefined) {
+            changed =
+                existing.steamOriginalPrice !== steamOriginalPrice || changed;
+            merged.steamOriginalPrice = steamOriginalPrice;
+        }
+        if (discountPercent !== undefined) {
+            changed = existing.discountPercent !== discountPercent || changed;
+            merged.discountPercent = discountPercent;
         }
         if (aksPrice !== undefined) {
             changed = existing.aksPrice !== aksPrice || changed;
@@ -495,8 +774,12 @@
     // region-unavailable games return "data":[] (no price_overview); unknown
     // appids come back with success:false and keep their price.
     async function fetchPricesBatch(appids) {
+        const batchCount = Math.ceil(appids.length / PRICE_BATCH_SIZE);
+        const totals = { priced: 0, noPrice: 0, failed: 0 };
+        let batchIndex = 0;
         for (let i = 0; i < appids.length; i += PRICE_BATCH_SIZE) {
             const chunk = appids.slice(i, i + PRICE_BATCH_SIZE);
+            batchIndex++;
             const url =
                 `${APPDETAILS_URL}?appids=${chunk.join(",")}&cc=${STEAM_CC}` +
                 `&l=${STEAM_LANG}&filters=price_overview`;
@@ -504,31 +787,102 @@
             let changed = false;
 
             if (res.ok && res.json) {
+                const pricedIds = [];
+                const noPriceIds = [];
+                const failedIds = [];
                 chunk.forEach((appid) => {
                     const info = res.json[appid];
-                    if (!info || info.success !== true) return;
+                    if (!info || info.success !== true) {
+                        failedIds.push(appid);
+                        return;
+                    }
 
                     const d = info.data;
                     const p = d && !Array.isArray(d) ? d.price_overview : null;
                     if (p && typeof p.final === "number") {
+                        const final = p.final / 100;
+                        // A price appeared (e.g. a pre-order went live):
+                        // drop the "without price" sentinel.
+                        if ((store[appid] || {}).noPrice === true) {
+                            delete store[appid].noPrice;
+                            changed = true;
+                        }
+                        pricedIds.push(appid);
                         changed =
-                            updateGamePrice(appid, { steamPrice: p.final / 100 }) || changed;
+                            updateGamePrice(appid, {
+                                steamPrice: final,
+                                // Pre-discount price for the "original value"
+                                // total; without a discount they're equal.
+                                steamOriginalPrice:
+                                    typeof p.initial === "number"
+                                        ? p.initial / 100
+                                        : final,
+                                // Authoritative "on sale" flag; a bundle deal
+                                // in the panel must not count as one.
+                                discountPercent:
+                                    typeof p.discount_percent === "number"
+                                        ? p.discount_percent
+                                        : 0,
+                            }) || changed;
                         return;
                     }
-                    // No price_overview (free, subscription, unavailable):
-                    // if is_free is unknown, resolve it via basic.
+                    // No price_overview (free, subscription, unreleased,
+                    // unavailable): free games resolve to 0 via basic. The
+                    // rest are marked "without price" and any cached price
+                    // is purged — with no API price to overwrite it, a
+                    // phantom DOM capture (panel read mid-swap) would
+                    // otherwise survive forever.
                     const entry = store[appid] || {};
-                    if (entry.is_free === true && typeof entry.steamPrice !== "number") {
-                        changed = updateGamePrice(appid, { steamPrice: 0 }) || changed;
-                    } else if (typeof entry.is_free !== "boolean") {
-                        queueNameFetch(appid);
+                    if (entry.is_free === true) {
+                        noPriceIds.push(appid);
+                        if (typeof entry.steamPrice !== "number") {
+                            changed =
+                                updateGamePrice(appid, {
+                                    steamPrice: 0,
+                                    steamOriginalPrice: 0,
+                                    discountPercent: 0,
+                                }) || changed;
+                        }
+                    } else {
+                        if (typeof entry.is_free !== "boolean") {
+                            queueNameFetch(appid);
+                        }
+                        noPriceIds.push(appid);
+                        const clean = { ...entry, noPrice: true };
+                        const hadPrice =
+                            clean.steamPrice !== undefined ||
+                            clean.steamOriginalPrice !== undefined ||
+                            clean.discountPercent !== undefined ||
+                            clean.price !== undefined ||
+                            clean.ts !== undefined;
+                        delete clean.steamPrice;
+                        delete clean.steamOriginalPrice;
+                        delete clean.discountPercent;
+                        delete clean.price;
+                        delete clean.ts;
+                        if (hadPrice || entry.noPrice !== true) {
+                            store[appid] = clean;
+                            changed = true;
+                        }
                     }
                 });
+                totals.priced += pricedIds.length;
+                totals.noPrice += noPriceIds.length;
+                totals.failed += failedIds.length;
+                log(
+                    `prices batch ${batchIndex}/${batchCount} → priced: ${pricedIds.length}, noPrice(data:[]): ${noPriceIds.length}${noPriceIds.length ? " " + noPriceIds.join(",") : ""}, success:false: ${failedIds.length}${failedIds.length ? " " + failedIds.join(",") : ""}`,
+                );
+            } else {
+                log(`prices batch ${batchIndex}/${batchCount} → request failed (${res.error})`);
+                totals.failed += chunk.length;
             }
 
             if (changed) persistStore();
             inject();
         }
+        log(
+            `API price totals → priced: ${totals.priced}, noPrice: ${totals.noPrice}, success:false: ${totals.failed} (total chunks ${batchCount})`,
+        );
     }
 
     // Name (+ is_free) of a game: one basic call per appid (filters=basic
@@ -570,7 +924,11 @@
                 changed = true;
             }
             if (isFree && typeof store[appid].steamPrice !== "number") {
-                changed = updateGamePrice(appid, { steamPrice: 0 }) || changed;
+                changed =
+                    updateGamePrice(appid, {
+                        steamPrice: 0,
+                        steamOriginalPrice: 0,
+                    }) || changed;
             }
         } else {
             console.warn("[WishlistMinPrice] No Steam basic data for", appid);
@@ -599,6 +957,7 @@
         apiMode = true;
         const appids = items.map((i) => String(i.appid));
         apiWishlistTotal = appids.length;
+        log(`wishlist API ok: ${appids.length} games`);
 
         reconcileCache(appids);
 
@@ -766,6 +1125,35 @@
         }
     }
 
+    function getWishlistScroller() {
+        const panel = document.querySelector("div.Panel");
+        if (panel) {
+            let cur = panel.parentElement;
+            while (cur && cur !== document.body && cur !== document.documentElement) {
+                if (cur.scrollHeight > cur.clientHeight + 20) {
+                    const style = window.getComputedStyle(cur);
+                    if (/(auto|scroll)/.test(style.overflowY + style.overflow)) return cur;
+                }
+                cur = cur.parentElement;
+            }
+        }
+        // Fallback: widest scrollable div on the page (new wishlist uses an inner scroller)
+        let best = null;
+        let bestH = 0;
+        document.querySelectorAll("div").forEach((el) => {
+            if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200) {
+                const style = window.getComputedStyle(el);
+                if (/(auto|scroll)/.test(style.overflowY + style.overflow)) {
+                    if (el.scrollHeight > bestH) {
+                        bestH = el.scrollHeight;
+                        best = el;
+                    }
+                }
+            }
+        });
+        return best || document.scrollingElement || document.documentElement;
+    }
+
     // Scrolls through the virtualized wishlist capturing all panels. Aborts
     // as soon as the user scrolls (captured data stays; the rest keeps the
     // API price). Restores the scroll position when done without abort.
@@ -774,18 +1162,41 @@
         sweepState.active = true;
         sweepState.aborted = false;
 
-        const scroller = document.scrollingElement || document.documentElement;
-        const initialTop = scroller.scrollTop;
+        const scroller = getWishlistScroller();
+        const isWindowScroller =
+            scroller === document.scrollingElement ||
+            scroller === document.documentElement ||
+            scroller === document.body;
+        const scrollTarget = isWindowScroller ? window : scroller;
+        const getTop = () =>
+            isWindowScroller
+                ? window.scrollY || document.documentElement.scrollTop
+                : scroller.scrollTop;
+        const getMaxTop = () =>
+            isWindowScroller
+                ? document.documentElement.scrollHeight - window.innerHeight
+                : scroller.scrollHeight - scroller.clientHeight;
+        const setTop = (v) => {
+            if (isWindowScroller) {
+                const s = document.scrollingElement || document.documentElement;
+                s.scrollTop = v;
+                window.scrollTo(0, v);
+            } else {
+                scroller.scrollTop = v;
+            }
+        };
+        const initialTop = getTop();
         sweepState.expectedTop = initialTop;
+        log(
+            `Sweep scroller: ${scroller.className ? "." + scroller.className.split(" ").slice(0,2).join(".") : scroller.tagName} (windowScroller=${isWindowScroller})`,
+        );
 
         const onScroll = () => {
-            // Our own scroll fires the event right after setting expectedTop;
-            // any deviation means the user moved the page.
-            if (Math.abs(scroller.scrollTop - sweepState.expectedTop) > 4) {
+            if (Math.abs(getTop() - sweepState.expectedTop) > 4) {
                 sweepState.aborted = true;
             }
         };
-        window.addEventListener("scroll", onScroll, { passive: true });
+        scrollTarget.addEventListener("scroll", onScroll, { passive: true });
 
         try {
             scanVisiblePanels();
@@ -798,26 +1209,25 @@
                 ![...wanted].every((id) => sessionSeenIds.has(id))
             ) {
                 const before = sessionSeenIds.size;
-                const maxTop = scroller.scrollHeight - window.innerHeight;
-                const target = Math.min(
-                    scroller.scrollTop + window.innerHeight * 0.9,
-                    maxTop,
-                );
+                const maxTop = getMaxTop();
+                const curTop = getTop();
+                const step = isWindowScroller ? window.innerHeight * 0.9 : scroller.clientHeight * 0.9;
+                const target = Math.min(curTop + step, maxTop);
                 sweepState.expectedTop = target;
-                scroller.scrollTop = target;
+                setTop(target);
                 await waitSweepStep();
                 scanVisiblePanels();
                 idleSteps = sessionSeenIds.size === before ? idleSteps + 1 : 0;
             }
 
-            console.log(
-                `[WishlistMinPrice] Sweep finished: ${sessionSeenIds.size}/${appids.length} games captured` +
+            log(
+                `Sweep finished: ${sessionSeenIds.size}/${appids.length} games captured` +
                 (sweepState.aborted ? " (aborted: you scrolled)" : ""),
             );
         } finally {
-            window.removeEventListener("scroll", onScroll);
-            if (!sweepState.aborted && scroller.scrollTop !== initialTop) {
-                scroller.scrollTop = initialTop;
+            scrollTarget.removeEventListener("scroll", onScroll);
+            if (!sweepState.aborted && getTop() !== initialTop) {
+                setTop(initialTop);
             }
             sweepState.active = false;
             inject();
@@ -825,8 +1235,8 @@
     }
 
     // Scans the currently rendered .Panel elements (Steam virtualizes them
-    // on scroll): captures the Steam price from the DOM and queues an
-    // AllKeyShop lookup by name when our price for that game is stale.
+    // on scroll): captures Steam's sale + original prices from the DOM and
+    // queues an AllKeyShop lookup by name when our price is stale.
     function scanVisiblePanels() {
         const panels = document.querySelectorAll("div.Panel");
         let changed = false;
@@ -839,10 +1249,71 @@
             const { appid, name } = info;
             sessionSeenIds.add(appid);
 
-            const steamPrice = extractSteamPrice(panel);
             const update = {};
-            if (steamPrice !== null) update.steamPrice = steamPrice;
             if (name) update.name = name;
+
+            // Price capture needs a fully painted panel: an empty name means
+            // the href already points to the next game while the price tag
+            // still shows the previous one's — reading it would attach a
+            // phantom price to the new appid. Games the API declared without
+            // price never render a price tag, so any capture for them is
+            // garbage as well.
+            if (name) {
+                const entryForPanel = store[appid] || {};
+                const prices = extractSteamPrices(panel);
+                const badgePercent = extractDiscountPercent(panel);
+                // Diagnostics snapshot: what this panel actually rendered
+                // (ground truth, never persisted; also what AS counts from).
+                const snap = domSnapshot.get(appid) || {
+                    tag: null,
+                    badge: null,
+                    seen: 0,
+                };
+                snap.seen += 1;
+                if (prices.discounted !== null) snap.tag = prices.discounted;
+                if (badgePercent !== null) snap.badge = badgePercent;
+                domSnapshot.set(appid, snap);
+                if (verboseCapture) {
+                    log("capture", appid, `"${name}"`, "tag:", prices.discounted, "badge:", badgePercent);
+                }
+                const isNoPrice = entryForPanel.noPrice === true;
+                if (!isNoPrice) {
+                    if (prices.discounted !== null) {
+                        update.steamPrice = prices.discounted;
+                        if (prices.original !== null) {
+                            update.steamOriginalPrice = prices.original;
+                        }
+                        if (badgePercent !== null) {
+                            update.discountPercent = badgePercent;
+                        } else if (
+                            typeof entryForPanel.discountPercent !== "number"
+                        ) {
+                            update.discountPercent = 0;
+                        }
+                        if (entryForPanel._noPriceMisses) {
+                            const clean = { ...entryForPanel };
+                            delete clean._noPriceMisses;
+                            store[appid] = clean;
+                        }
+                    } else if (typeof entryForPanel.steamPrice === "number") {
+                        const misses = (entryForPanel._noPriceMisses || 0) + 1;
+                        if (misses >= 2) {
+                            const clean = { ...entryForPanel, noPrice: true };
+                            delete clean.steamPrice;
+                            delete clean.steamOriginalPrice;
+                            delete clean.discountPercent;
+                            delete clean.price;
+                            delete clean.ts;
+                            delete clean._noPriceMisses;
+                            store[appid] = clean;
+                            changed = true;
+                        } else {
+                            store[appid] = { ...entryForPanel, _noPriceMisses: misses };
+                            changed = true;
+                        }
+                    }
+                }
+            }
 
             if (Object.keys(update).length > 0) {
                 if (updateGamePrice(appid, update)) changed = true;
@@ -870,113 +1341,278 @@
         });
     }
 
-    // ---------- Wishlist total count (DOM mode only) ----------
-    function getWishlistTotalCount() {
-        const stats = document.querySelectorAll(
-            ".stats.svelte-1vzkkpc .stat.svelte-1vzkkpc",
-        );
-        for (const stat of stats) {
-            const label = stat.querySelector(".label");
-            if (label && label.textContent.trim() === "on wishlist") {
-                const n = parseInt(stat.textContent.replace(/\D/g, ""), 10);
-                return isNaN(n) ? null : n;
-            }
-        }
-        return null;
-    }
-
-    function computeMinimumTotal() {
+    // Totals across the cache in one pass:
+    // - total: minimum value (min of Steam's price and AllKeyShop's offer)
+    // - currentTotal: what Steam itself charges right now (its own
+    //   discounts, incl. the bundle deals shown in the wishlist panels)
+    // - originalTotal: pre-discount Steam prices (upper bound)
+    // - onSaleCount / noPriceCount: wishlist stats, like the extensions show
+    function computeTotals() {
         const ids = Object.keys(store);
         const now = Date.now();
 
         let total = 0;
+        let currentTotal = 0;
+        let originalTotal = 0;
         let freshCount = 0;
+        let onSaleCount = 0;
+        let noPriceCount = 0;
 
         ids.forEach((id) => {
             const entry = store[id];
-            // Only count games with a real Steam price; aksPrice alone must
-            // not inflate the wishlist minimum.
-            if (typeof entry.price !== "number") return;
-            if (typeof entry.steamPrice !== "number") return;
-            total += entry.price;
-            if (entry.ts && now - entry.ts < MAX_AGE_MS) freshCount++;
+            // Free-to-play games show no price tag in the panel; AugmentedSteam
+            // counts them as "without price" (the bar should match AS).
+            if (entry.is_free === true) {
+                noPriceCount++;
+                return;
+            }
+            const fresh = Boolean(entry.ts && now - entry.ts < MAX_AGE_MS);
+
+            if (typeof entry.steamPrice === "number") {
+                currentTotal += entry.steamPrice;
+
+                // Only count games with a real Steam price in the minimum;
+                // an aksPrice alone must not inflate it.
+                if (typeof entry.price === "number") {
+                    total += entry.price;
+                    if (fresh) freshCount++;
+                }
+
+                // "On sale" uses Steam's own discount flag; a bundle deal
+                // in the panel must not count as a sale. Legacy entries
+                // without the field fall back to the price comparison.
+                const onSale =
+                    typeof entry.discountPercent === "number"
+                        ? entry.discountPercent > 0
+                        : typeof entry.steamOriginalPrice === "number" &&
+                          entry.steamOriginalPrice > entry.steamPrice + 0.005;
+                if (onSale) onSaleCount++;
+
+                if (typeof entry.steamOriginalPrice === "number") {
+                    originalTotal += entry.steamOriginalPrice;
+                } else {
+                    // Legacy cache entry (pre-3.5): until the next refresh,
+                    // Steam's own price stands in so the original total
+                    // never dips below current/minimum meanwhile.
+                    originalTotal += entry.steamPrice;
+                }
+            } else {
+                // No price known (unreleased, subscription, unavailable...).
+                noPriceCount++;
+            }
         });
 
-        return { total, freshCount };
+        return {
+            total,
+            currentTotal,
+            originalTotal,
+            freshCount,
+            onSaleCount,
+            noPriceCount,
+            storeSize: ids.length,
+        };
     }
 
     // ---------- Stat injection / update ----------
-    function injectMinStat(statsContainer) {
+    // Own stylesheet: Steam's hashed class names can't be reused reliably,
+    // so the stat ships with self-contained tm-* styling matching the page
+    // (Motiva Sans, blue #1a9fff labels, hairline divider like Steam's).
+    function ensureStyles() {
+        if (document.getElementById("tm-wishlist-min-styles")) return;
+        const style = document.createElement("style");
+        style.id = "tm-wishlist-min-styles";
+        style.textContent =
+            ".tm-min-bar{display:flex;align-items:center;flex-wrap:wrap;" +
+            "gap:4px 16px;margin-top:8px;padding-top:8px;" +
+            "border-top:1px solid rgba(255,255,255,.08);" +
+            "font-family:'Motiva Sans',Arial,Helvetica,sans-serif}" +
+            ".tm-min-bar .tm-min-group{display:flex;align-items:baseline;gap:6px}" +
+            ".tm-min-bar .tm-min-price,.tm-min-bar .tm-min-count{font-weight:700;" +
+            "color:#fff;font-size:15px;line-height:1.3;" +
+            "font-variant-numeric:tabular-nums}" +
+            ".tm-min-bar .tm-min-label{font-size:11px;color:#1a9fff;" +
+            "text-transform:uppercase;letter-spacing:.5px}" +
+            ".tm-min-bar .tm-min-sep{width:1px;height:14px;" +
+            "background:rgba(255,255,255,.15)}" +
+            ".tm-min-bar .tm-min-reset{cursor:pointer;opacity:.6;margin-left:2px;" +
+            "transition:opacity .15s ease;background:none;border:none;padding:0;" +
+            "font:inherit;color:inherit;line-height:1}"+
+            ".tm-min-bar .tm-min-reset:hover{opacity:1}"+
+            ".tm-min-bar .tm-min-reset:focus{outline:1px solid #1a9fff;outline-offset:2px}"+
+            ".tm-min-bar .tm-min-reset:focus:not(:focus-visible){outline:none}";
+        document.head.appendChild(style);
+    }
+
+    function injectMinStat(bar) {
         // DOM mode also captures visible panels on each injection; API mode
         // already has the data.
         if (!apiMode && domModeStarted) scanVisiblePanels();
 
-        const { total, freshCount } = computeMinimumTotal();
-        const wishlistTotal =
-            apiWishlistTotal !== null ? apiWishlistTotal : getWishlistTotalCount();
+        const {
+            total,
+            currentTotal,
+            originalTotal,
+            freshCount,
+            onSaleCount,
+            noPriceCount,
+            storeSize,
+        } = computeTotals();
+        const wishlistTotal = apiWishlistTotal;
 
-        let statDiv = statsContainer.querySelector(".tm-min-value-stat");
+        // Reuse the row sitting right after the bar; drop stale copies that
+        // React left behind after re-renders.
+        let statDiv = null;
+        document.querySelectorAll(".tm-min-bar").forEach((el) => {
+            if (!statDiv && el.previousElementSibling === bar) {
+                statDiv = el;
+            } else {
+                el.remove();
+            }
+        });
+
         if (!statDiv) {
+            // Groups, cheapest-first: minimum (Steam vs AllKeyShop), current
+            // (Steam's own prices in the wishlist) and original (pre-discount);
+            // then wishlist stats: total, on sale, without price.
+            const newGroup = () => {
+                const group = document.createElement("span");
+                group.className = "tm-min-group";
+                const price = document.createElement("span");
+                price.className = "tm-min-price";
+                group.appendChild(price);
+                return { group, price };
+            };
+            const addSeparator = () => {
+                const sep = document.createElement("span");
+                sep.className = "tm-min-sep";
+                statDiv.appendChild(sep);
+            };
+            const addCountGroup = (key, label) => {
+                const group = document.createElement("span");
+                group.className = "tm-min-group";
+                const value = document.createElement("span");
+                value.className = "tm-min-count";
+                value.dataset.tmKey = key;
+                group.appendChild(value);
+                const text = document.createElement("span");
+                text.className = "tm-min-label";
+                text.textContent = label;
+                group.appendChild(text);
+                statDiv.appendChild(group);
+                return value;
+            };
+
             statDiv = document.createElement("div");
-            statDiv.className = "stat svelte-1vzkkpc tm-min-value-stat";
-            statDiv.appendChild(document.createTextNode(""));
+            statDiv.className = "tm-min-bar";
 
-            const label = document.createElement("span");
-            label.className = "label svelte-1vzkkpc";
+            // 1) Minimum value + reset button.
+            const min = newGroup();
+            const minLabel = document.createElement("span");
+            minLabel.className = "tm-min-label";
 
-            const labelText = document.createElement("span");
-            labelText.className = "tm-min-label-text";
-            label.appendChild(labelText);
+            const minLabelText = document.createElement("span");
+            minLabelText.className = "tm-min-label-text";
+            minLabel.appendChild(minLabelText);
 
             // Small reset button so the cache can be cleared without the console
-            const resetBtn = document.createElement("span");
-            resetBtn.textContent = " ⟲";
-            resetBtn.title = "Clear cached minimum prices";
-            resetBtn.style.cursor = "pointer";
-            resetBtn.style.opacity = "0.6";
-            resetBtn.addEventListener("mouseenter", () => {
-                resetBtn.style.opacity = "1";
-            });
-            resetBtn.addEventListener("mouseleave", () => {
-                resetBtn.style.opacity = "0.6";
-            });
-            resetBtn.addEventListener("click", (e) => {
+            const resetBtn = document.createElement("button");
+            resetBtn.type = "button";
+            resetBtn.className = "tm-min-reset";
+            resetBtn.textContent = "⟲";
+            resetBtn.title = "Clear cached prices (keeps game names)";
+            resetBtn.setAttribute("aria-label", "Clear cached prices");
+            const doReset = (e) => {
                 e.stopPropagation();
                 e.preventDefault();
-                if (confirm("Clear the prices and query again? Game names are kept.")) {
+                const ok =
+                    typeof unsafeWindow.confirm === "function"
+                        ? unsafeWindow.confirm(
+                              "Clear the prices and query again? Game names are kept.",
+                          )
+                        : confirm("Clear the prices and query again? Game names are kept.");
+                if (ok) {
+                    console.log("[WishlistMinPrice] Reset clicked");
                     resetCache();
                 }
-            });
-            label.appendChild(resetBtn);
+            };
+            resetBtn.addEventListener("click", doReset);
+            resetBtn.addEventListener("auxclick", doReset);
+            minLabel.appendChild(resetBtn);
 
-            statDiv.appendChild(label);
+            min.group.appendChild(minLabel);
+            statDiv.appendChild(min.group);
 
-            const stats = Array.from(statsContainer.children);
-            const currentValueStat = stats.find((el) => {
-                const lbl = el.querySelector(".label");
-                return lbl && lbl.textContent.trim() === "current value";
-            });
+            addSeparator();
 
-            if (currentValueStat) {
-                currentValueStat.insertAdjacentElement("afterend", statDiv);
-            } else {
-                statsContainer.insertBefore(statDiv, statsContainer.firstChild);
-            }
+            // 2) Current value (Steam's own wishlist prices).
+            const current = newGroup();
+            const currentLabel = document.createElement("span");
+            currentLabel.className = "tm-min-label";
+            currentLabel.textContent = "current value";
+            current.group.appendChild(currentLabel);
+            statDiv.appendChild(current.group);
+
+            addSeparator();
+
+            // 3) Original value (pre-discount).
+            const orig = newGroup();
+            const origLabel = document.createElement("span");
+            origLabel.className = "tm-min-label";
+            origLabel.textContent = "original value";
+            orig.group.appendChild(origLabel);
+            statDiv.appendChild(orig.group);
+
+            // 4) Wishlist stats.
+            addSeparator();
+            addCountGroup("wishlist", "on wishlist");
+            addSeparator();
+            addCountGroup("sale", "on sale");
+            addSeparator();
+            addCountGroup("noprice", "without price");
+
+            bar.insertAdjacentElement("afterend", statDiv);
         }
 
-        statDiv.childNodes[0].textContent = formatPrice(total);
+        // Only touch the DOM when a value actually changed: assigning
+        // textContent unconditionally would mutate the page, re-trigger the
+        // observer and keep the row "updating" forever.
+        const setText = (el, text) => {
+            if (el.textContent !== text) el.textContent = text;
+        };
 
-        const labelText = statDiv.querySelector(".tm-min-label-text");
-        labelText.textContent = wishlistTotal
-            ? `minimum value (${freshCount}/${wishlistTotal})`
-            : "minimum value";
+        const priceEls = statDiv.querySelectorAll(".tm-min-price");
+        setText(priceEls[0], formatPrice(total));
+        setText(priceEls[1], formatPrice(currentTotal));
+        setText(priceEls[2], formatPrice(originalTotal));
+
+        const gameTotal = wishlistTotal !== null ? wishlistTotal : storeSize;
+        setText(
+            statDiv.querySelector('[data-tm-key="wishlist"]'),
+            String(gameTotal),
+        );
+        setText(statDiv.querySelector('[data-tm-key="sale"]'), String(onSaleCount));
+        setText(
+            statDiv.querySelector('[data-tm-key="noprice"]'),
+            String(noPriceCount),
+        );
+
+        const minLabelText = statDiv.querySelector(".tm-min-label-text");
+        setText(
+            minLabelText,
+            wishlistTotal
+                ? `minimum value (${freshCount}/${wishlistTotal})`
+                : "minimum value",
+        );
     }
 
     function tryInject() {
-        const statsContainer = document.querySelector(".stats.svelte-1vzkkpc");
-        if (statsContainer) {
-            injectMinStat(statsContainer);
-        }
+        // Steam's controls bar, found structurally instead of by hashed
+        // class names: the search box is the page's only <input> that is a
+        // direct child of a .Panel (the Options/Sort popovers nest theirs
+        // inside <label>/<form>), whatever the locale.
+        const searchInput = document.querySelector("div.Panel > input");
+        const bar = searchInput ? searchInput.parentElement : null;
+        if (bar) injectMinStat(bar);
     }
 
     function inject() {
@@ -1001,12 +1637,7 @@
     function startDomMode() {
         if (domModeStarted) return;
         domModeStarted = true;
-        console.log("[WishlistMinPrice] DOM mode (fallback) active");
-        scanObserver.observe(document.body, {
-            childList: true,
-            subtree: true,
-            characterData: true,
-        });
+        log("DOM mode active (API unavailable or no steamid)");
         setInterval(scanVisiblePanels, POLL_INTERVAL_MS);
     }
 
@@ -1014,6 +1645,7 @@
         const steamid = resolveSteamId();
         storageKey = getStorageKey(steamid);
         loadStore();
+        log(`v${SCRIPT_VERSION} ready (key=${storageKey}, entries=${Object.keys(store).length})`);
 
         let migrated = false;
         Object.keys(store).forEach((id) => {
@@ -1032,8 +1664,19 @@
         if (migrated) persistStore();
 
         // Injection observer is common to both modes: reacts to DOM changes
-        // (e.g. the Augmented Steam stats container appearing).
+        // (e.g. Steam's controls bar appearing).
+        ensureStyles();
         injectObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            characterData: true,
+        });
+
+        // Panel capture runs in both modes: the sweep grabs everything
+        // upfront, but the observer also catches prices (incl. bundle deals)
+        // as panels render during normal browsing — with the API as the
+        // fallback for anything never painted on screen.
+        scanObserver.observe(document.body, {
             childList: true,
             subtree: true,
             characterData: true,
