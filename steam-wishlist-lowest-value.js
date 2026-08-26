@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Steam Wishlist Lowest Value
 // @namespace    http://tampermonkey.net/
-// @version      3.11
-// @description  Shows three totals for your wishlist in Steam's native controls bar: minimum value (Steam's real prices, incl. bundle pricing, compared with AllKeyShop's lowest offer, queried directly from its API), current value (Steam's own prices with the discounts/bundles visible in the wishlist) and original value (sum of pre-discount Steam prices), plus wishlist stats (total, on sale, without price). The wishlist comes from the official Steam API; prices are captured by auto-sweeping the virtualized list (aborts if you scroll); DOM scraping is the fallback when the API fails (private wishlist, timeout, etc.).
+// @version      4.0
+// @description  Shows three totals for your wishlist in Steam's native controls bar: minimum value (Steam's real prices via IStoreBrowseService/GetItems like AugmentedSteam, compared with AllKeyShop's lowest offer), current value and original value, plus wishlist stats. Prices come from IStoreBrowseService/GetItems (protobuf, no scrolling) with appdetails/DOM as fallback; DOM scraping is passive only.
 // @author       Menosuno02
 // @match        https://store.steampowered.com/wishlist/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=steampowered.com
@@ -26,14 +26,16 @@
     // wishlist) or the logged-in user's data (see resolveSteamId).
     const DEFAULT_STEAMID = "";
 
-    // Country/language for appdetails prices (cc=es -> EUR).
-    const STEAM_CC = "es";
-    const STEAM_LANG = "es";
+    // Country/language — now detected dynamically (see getStoreCountry/getStoreLanguage).
+    // Fallback kept for very early init before DOM is ready.
+    const FALLBACK_CC = "es";
+    const FALLBACK_LANG = "spanish";
     const WISHLIST_API_URL =
         "https://api.steampowered.com/IWishlistService/GetWishlist/v1/";
     const APPDETAILS_URL = "https://store.steampowered.com/api/appdetails";
-    // appdetails accepts many appids per call, but batch to stay under URL length limits.
+    // appdetails / StoreBrowse accept many appids per call, but batch to stay under URL length limits.
     const PRICE_BATCH_SIZE = 50;
+    const STORE_BROWSE_BATCH_SIZE = 50; // same as AugmentedSteam Zd
     // Timeout/retries for Steam calls (their weak point).
     const STEAM_TIMEOUT_MS = 15000;
     const STEAM_RETRY_DELAY_MS = 2000;
@@ -65,6 +67,10 @@
     let apiMode = false; // API responded successfully
     let apiWishlistTotal = null; // wishlist size per API (coverage)
     let domModeStarted = false; // only started if the API fails
+    // True while an API refresh is in flight: panels can be stale on a
+    // long-open tab, so price capture from the DOM waits until the API pass
+    // has stamped fresh entries (apiTs) or definitively failed.
+    let domCaptureSuppressed = false;
     const sessionSeenIds = new Set();
     const pendingAksFetch = new Set();
     const aksQueue = [];
@@ -113,7 +119,7 @@
         }
     }
 
-    function resetCache() {
+    function resetCache({ reload = true } = {}) {
         // Drop prices but keep names, then trigger a full refresh.
         Object.keys(store).forEach((id) => {
             const { name, is_free } = store[id];
@@ -130,7 +136,17 @@
         log(`resetCache: cleared entries (names kept, key=${storageKey}, left=${Object.keys(store).length})`);
 
         const steamid = resolveSteamId();
-        if (steamid) {
+        if (steamid && reload) {
+            // The in-place pass can pick up stale panel prices for items the
+            // APIs miss (panels were rendered at page load, hours ago). A
+            // fresh page re-renders everything with current data — init()
+            // then runs the full refresh. This is the path that shows the
+            // right totals (verified on manual reload).
+            log("reset: reloading the page to refresh with clean data");
+            setTimeout(() => {
+                location.reload();
+            }, 80);
+        } else if (steamid) {
             refreshFromApi(steamid);
         } else {
             startDomMode();
@@ -288,6 +304,33 @@
     unsafeWindow.__wishlistMinPriceVerbose = function (on = true) {
         verboseCapture = Boolean(on);
         log(`verbose capture ${verboseCapture ? "ON" : "OFF"}`);
+    };
+
+    // Diagnostics: which entries were priced by the API (authoritative) and
+    // which came from the DOM/fallback (can be stale on a long-open tab).
+    // A single "dom/fallback" entry whose price changes after a reload is
+    // the game contaminating the totals.
+    unsafeWindow.__wishlistMinPriceSource = function () {
+        const rows = Object.entries(store).map(([appid, v]) => ({
+            appid,
+            name: v.name || "(no name)",
+            source: typeof v.apiTs === "number" ? "api" : "dom/fallback",
+            steamPrice: typeof v.steamPrice === "number" ? v.steamPrice : null,
+            steamOriginal:
+                typeof v.steamOriginalPrice === "number"
+                    ? v.steamOriginalPrice
+                    : null,
+            discount:
+                typeof v.discountPercent === "number" ? v.discountPercent : null,
+            aksPrice: typeof v.aksPrice === "number" ? v.aksPrice : null,
+            noPrice: v.noPrice === true,
+        }));
+        const nonApi = rows.filter((r) => r.source !== "api");
+        log(
+            `sources → api: ${rows.length - nonApi.length}, dom/fallback: ${nonApi.length}`,
+        );
+        console.table(nonApi);
+        return nonApi;
     };
 
     // Diagnostics (manual): compares our cache against the legacy
@@ -695,6 +738,573 @@
         return DEFAULT_STEAMID;
     }
 
+    // ---------- Store country / language (dynamic, like AugmentedSteam) ----------
+    function getStoreCountry() {
+        try {
+            const usp = new URLSearchParams(location.search);
+            if (usp.has("cc")) {
+                const cc = usp.get("cc");
+                if (cc && /^[a-z]{2}$/i.test(cc)) return cc.toUpperCase();
+            }
+            const cfgEl = document.querySelector("#application_config, #webui_config");
+            if (cfgEl && cfgEl.dataset.config) {
+                const j = JSON.parse(cfgEl.dataset.config);
+                if (j.COUNTRY && typeof j.COUNTRY === "string") return j.COUNTRY.toUpperCase();
+            }
+            if (unsafeWindow.Config && typeof unsafeWindow.Config.COUNTRY === "string") {
+                return unsafeWindow.Config.COUNTRY.toUpperCase();
+            }
+            const m = document.documentElement.innerHTML.match(/GDynamicStore\.Init\(.+?,\s*'([A-Z]{2})'/);
+            if (m) return m[1].toUpperCase();
+            // AugmentedSteam also tries store_user_config via dataset, handled above
+        } catch (e) {
+            /* ignore */
+        }
+        return FALLBACK_CC.toUpperCase();
+    }
+
+    function getStoreLanguage() {
+        try {
+            const cfgEl = document.querySelector("#application_config, #webui_config");
+            if (cfgEl && cfgEl.dataset.config) {
+                const j = JSON.parse(cfgEl.dataset.config);
+                if (j.LANGUAGE && typeof j.LANGUAGE === "string") return j.LANGUAGE.toLowerCase();
+            }
+            if (unsafeWindow.Config && typeof unsafeWindow.Config.LANGUAGE === "string") {
+                return unsafeWindow.Config.LANGUAGE.toLowerCase();
+            }
+            const m = document.documentElement.innerHTML.match(/g_strLanguage\s*=\s*["']([^"']+)["']/);
+            if (m) return m[1].toLowerCase();
+        } catch (e) {
+            /* ignore */
+        }
+        return FALLBACK_LANG.toLowerCase(); // "spanish" for ES fallback
+    }
+
+    // For appdetails (expects cc=es & l=es or l=spanish). Map full name to 2-letter when needed.
+    const LANG_TO_CC = {
+        english: "en",
+        spanish: "es",
+        french: "fr",
+        german: "de",
+        italian: "it",
+        portuguese: "pt",
+        brazilian: "pt-br",
+        russian: "ru",
+        polish: "pl",
+        dutch: "nl",
+        swedish: "sv",
+        norwegian: "no",
+        danish: "da",
+        finnish: "fi",
+        czech: "cs",
+        hungarian: "hu",
+        greek: "el",
+        turkish: "tr",
+        japanese: "ja",
+        korean: "ko",
+        schinese: "zh-cn",
+        tchinese: "zh-tw",
+        thai: "th",
+        ukrainian: "uk",
+    };
+    function languageToShort(lang) {
+        if (!lang) return FALLBACK_CC;
+        const low = lang.toLowerCase();
+        if (/^[a-z]{2}(-[a-z]{2})?$/.test(low)) return low; // already short
+        return LANG_TO_CC[low] || low.slice(0, 2);
+    }
+
+    // ---------- IStoreBrowseService (manual protobuf) ----------
+    // Manual varint / length-delimited codec to avoid pulling protobufjs.
+    // Request: CStoreBrowse_GetItems_Request { ids(1):StoreItemID, context(2), dataRequest(3) }
+    // Response: CStoreBrowse_GetItems_Response { storeItems(1):StoreItem }
+    // Only the subset we need is implemented.
+    function encodeVarint(value) {
+        let n = typeof value === "bigint" ? value : BigInt(value >>> 0);
+        // For signed negative we use BigInt directly; callers pass unsigned.
+        if (typeof value === "bigint") n = value;
+        else if (value < 0) n = BigInt(value);
+        const out = [];
+        while (n > 0x7fn) {
+            out.push(Number((n & 0x7fn) | 0x80n));
+            n >>= 7n;
+        }
+        out.push(Number(n & 0x7fn));
+        return out;
+    }
+    function encodeTag(field, wire) {
+        return encodeVarint((field << 3) | wire);
+    }
+    function encodeStringField(fieldNum, str) {
+        const utf8 = new TextEncoder().encode(str);
+        return [...encodeTag(fieldNum, 2), ...encodeVarint(utf8.length), ...utf8];
+    }
+    function encodeVarintField(fieldNum, value) {
+        return [...encodeTag(fieldNum, 0), ...encodeVarint(value)];
+    }
+    function encodeMessageField(fieldNum, innerBytes) {
+        return [...encodeTag(fieldNum, 2), ...encodeVarint(innerBytes.length), ...innerBytes];
+    }
+    function buildGetItemsPayload(appids, countryCode, language) {
+        const out = [];
+        // ids: repeated StoreItemID (field 1)
+        for (const a of appids) {
+            const appidNum = Number(a) >>> 0;
+            const inner = encodeVarintField(1, appidNum); // StoreItemID.appid = 1
+            out.push(...encodeMessageField(1, inner));
+        }
+        // context (field 2): StoreBrowseContext
+        const ctxInner = [];
+        if (language) ctxInner.push(...encodeStringField(1, language));
+        // elanguage (field 2) is optional int32; we omit to let server derive from language string
+        if (countryCode) ctxInner.push(...encodeStringField(3, countryCode));
+        ctxInner.push(...encodeVarintField(4, 1)); // steamRealm = 1 (k_ESteamRealmGlobal)
+        out.push(...encodeMessageField(2, ctxInner));
+        // dataRequest (field 3): StoreBrowseItemDataRequest
+        // AugmentedSteam uses includeBasicInfo:true alone for wishlist totals.
+        // includeBasicInfo is field 10 bool (tag 80 => 0x50)
+        const drInner = encodeVarintField(10, 1);
+        out.push(...encodeMessageField(3, drInner));
+        return new Uint8Array(out);
+    }
+    function base64EncodeBytes(bytes) {
+        let binary = "";
+        const chunk = 8192;
+        for (let i = 0; i < bytes.length; i += chunk) {
+            const slice = bytes.subarray(i, Math.min(i + chunk, bytes.length));
+            binary += String.fromCharCode.apply(null, slice);
+        }
+        return btoa(binary);
+    }
+    // --- Decoder helpers (varint/length-delimited) ---
+    function readVarint(buf, pos) {
+        let result = 0n;
+        let shift = 0n;
+        let i = pos;
+        let b;
+        do {
+            if (i >= buf.length) throw new Error("varint overflow");
+            b = BigInt(buf[i++]);
+            result |= (b & 0x7fn) << shift;
+            shift += 7n;
+        } while ((b & 0x80n) !== 0n);
+        // Return as Number when safe, otherwise BigInt
+        const value = result <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(result) : result;
+        return { value, bytesRead: i - pos };
+    }
+    function readString(buf, pos, len) {
+        const slice = buf.subarray(pos, pos + len);
+        return new TextDecoder().decode(slice);
+    }
+    function skipField(buf, pos, wire) {
+        if (wire === 0) {
+            const r = readVarint(buf, pos);
+            return pos + r.bytesRead;
+        }
+        if (wire === 1) return pos + 8;
+        if (wire === 2) {
+            const r = readVarint(buf, pos);
+            return pos + r.bytesRead + Number(r.value);
+        }
+        if (wire === 5) return pos + 4;
+        throw new Error("unsupported wire " + wire);
+    }
+    function decodePurchaseOption(buf) {
+        let pos = 0;
+        const o = {};
+        while (pos < buf.length) {
+            const tag = readVarint(buf, pos);
+            pos += tag.bytesRead;
+            const field = Number(tag.value) >> 3;
+            const wire = Number(tag.value) & 7;
+            if (wire === 2) {
+                const len = readVarint(buf, pos);
+                pos += len.bytesRead;
+                const str = readString(buf, pos, Number(len.value));
+                pos += Number(len.value);
+                if (field === 8) o.formattedFinalPrice = str;
+                else if (field === 9) o.formattedOriginalPrice = str;
+                else if (field === 15) o.formattedPriceBeforeBundleDiscount = str;
+            } else if (wire === 0) {
+                const v = readVarint(buf, pos);
+                pos += v.bytesRead;
+                const val = typeof v.value === "bigint" ? Number(v.value) : v.value;
+                if (field === 1) o.packageid = val;
+                else if (field === 2) o.bundleid = val;
+                else if (field === 5) o.finalPriceInCents = typeof v.value === "bigint" ? v.value : BigInt(val);
+                else if (field === 6) o.originalPriceInCents = typeof v.value === "bigint" ? v.value : BigInt(val);
+                else if (field === 10) o.discountPct = val;
+                else if (field === 12) o.bundleDiscountPct = val;
+                else if (field === 14) o.priceBeforeBundleDiscount = typeof v.value === "bigint" ? v.value : BigInt(val);
+                else if (field === 44) o.lowestRecentPriceInCents = typeof v.value === "bigint" ? v.value : BigInt(val);
+            } else if (wire === 1) pos += 8;
+            else if (wire === 5) pos += 4;
+            else throw new Error("unsupported wire in purchaseOption " + wire);
+        }
+        return o;
+    }
+    function decodeStoreItem(buf) {
+        let pos = 0;
+        const item = { name: "", purchaseOption: null };
+        while (pos < buf.length) {
+            const tag = readVarint(buf, pos);
+            pos += tag.bytesRead;
+            const field = Number(tag.value) >> 3;
+            const wire = Number(tag.value) & 7;
+            if (wire === 0) {
+                const v = readVarint(buf, pos);
+                pos += v.bytesRead;
+                const val = typeof v.value === "bigint" ? Number(v.value) : v.value;
+                if (field === 1) item.itemType = val;
+                else if (field === 2) item.id = val;
+                else if (field === 3) item.success = val;
+                else if (field === 4) item.visible = !!val;
+                else if (field === 9) item.appid = val;   // StoreItem.appid is field 9 (tag 72)
+                else if (field === 13) item.isFree = !!val; // StoreItem.isFree is field 13 (tag 104)
+                else if (field === 14) item.isEarlyAccess = !!val;
+                else if (field === 55) item.unlisted = !!val; // tag 440
+                // else ignore
+            } else if (wire === 2) {
+                const len = readVarint(buf, pos);
+                pos += len.bytesRead;
+                const nlen = Number(len.value);
+                const slice = buf.subarray(pos, pos + nlen);
+                pos += nlen;
+                if (field === 6) item.name = readString(slice, 0, slice.length);
+                else if (field === 7) item.storeUrlPath = readString(slice, 0, slice.length);
+                else if (field === 40) item.bestPurchaseOption = decodePurchaseOption(slice);
+                else if (field === 41) { /* purchaseOptions repeated - ignore for now */ }
+                // else skip (tags, assets etc)
+            } else if (wire === 1) {
+                pos += 8;
+            } else if (wire === 5) {
+                pos += 4;
+            } else {
+                throw new Error("unknown wire " + wire);
+            }
+        }
+        // Normalize id/appid (response usually carries id; appid when requested by appid)
+        if (item.appid == null && item.id != null) item.appid = item.id;
+        if (item.id == null && item.appid != null) item.id = item.appid;
+        return item;
+    }
+    function decodeGetItemsResponse(buf) {
+        let pos = 0;
+        const out = [];
+        while (pos < buf.length) {
+            const tag = readVarint(buf, pos);
+            pos += tag.bytesRead;
+            const field = Number(tag.value) >> 3;
+            const wire = Number(tag.value) & 7;
+            if (field === 1 && wire === 2) {
+                const len = readVarint(buf, pos);
+                pos += len.bytesRead;
+                const nlen = Number(len.value);
+                const slice = buf.subarray(pos, pos + nlen);
+                pos += nlen;
+                out.push(decodeStoreItem(slice));
+            } else {
+                // unknown field -> skip payload
+                if (wire === 0) {
+                    const v = readVarint(buf, pos);
+                    pos += v.bytesRead;
+                } else if (wire === 1) pos += 8;
+                else if (wire === 2) {
+                    const len = readVarint(buf, pos);
+                    pos += len.bytesRead;
+                    pos += Number(len.value);
+                } else if (wire === 5) pos += 4;
+                else throw new Error("unknown wire in response " + wire);
+            }
+        }
+        return out;
+    }
+
+    // ---------- Web API token (for IStoreBrowseService) ----------
+    let cachedWebApiToken = null;
+    let cachedWebApiTokenAt = 0;
+    let tokenFetchPromise = null;
+    // Steam web-api tokens expire; a stale cache makes StoreBrowse 401 after
+    // the tab has been open for a while. TTL keeps the cache short-lived.
+    const TOKEN_TTL_MS = 10 * 60 * 1000; // 10 min
+    function extractTokenFromDom() {
+        try {
+            const el = document.querySelector("#application_config");
+            if (el) {
+                if (el.dataset.store_user_config) {
+                    const j = JSON.parse(el.dataset.store_user_config);
+                    if (j.webapi_token) return j.webapi_token;
+                    if (j.webapiToken) return j.webapiToken;
+                }
+                if (el.dataset.config) {
+                    const j = JSON.parse(el.dataset.config);
+                    if (j.WEBAPI_TOKEN) return j.WEBAPI_TOKEN;
+                }
+            }
+            const el2 = document.querySelector("#webui_config");
+            if (el2 && el2.dataset.config) {
+                const j = JSON.parse(el2.dataset.config);
+                if (j.WEBAPI_TOKEN) return j.WEBAPI_TOKEN;
+            }
+            if (unsafeWindow.Config && unsafeWindow.Config.WEBAPI_TOKEN) return unsafeWindow.Config.WEBAPI_TOKEN;
+            // SSR.loaderData like AugmentedSteam: SSR.loaderData entries contain strWebAPIToken
+            const tryGlobal = (key) => {
+                try {
+                    const v = unsafeWindow[key];
+                    if (Array.isArray(v)) {
+                        for (const e of v) {
+                            const s = typeof e === "string" ? JSON.parse(e) : e;
+                            if (s && s.strWebAPIToken) return s.strWebAPIToken;
+                            if (s && s.webapi_token) return s.webapi_token;
+                        }
+                    } else if (v && typeof v === "object" && v.strWebAPIToken) return v.strWebAPIToken;
+                } catch (e) { /* ignore */ }
+                return null;
+            };
+            // Check known globals via unsafeWindow
+            const candidates = ["SSR", "SSR.loaderData", "Config", "UserConfig"];
+            for (const c of candidates) {
+                const parts = c.split(".");
+                let cur = unsafeWindow;
+                for (const p of parts) cur = cur && cur[p];
+                if (!cur) continue;
+                if (Array.isArray(cur)) {
+                    for (const e of cur) {
+                        try {
+                            const o = typeof e === "string" ? JSON.parse(e) : e;
+                            if (o && o.strWebAPIToken) return o.strWebAPIToken;
+                        } catch (e2) { /* ignore */ }
+                    }
+                } else if (typeof cur === "object" && cur.strWebAPIToken) return cur.strWebAPIToken;
+            }
+            // Also check scripts for strWebAPIToken
+            const scripts = document.querySelectorAll("script");
+            for (const s of scripts) {
+                const txt = s.textContent;
+                if (!txt || !txt.includes("strWebAPIToken")) continue;
+                const m = txt.match(/strWebAPIToken["']\s*:\s*["']([^"']+)["']/);
+                if (m) return m[1];
+                const m2 = txt.match(/webapi_token["']\s*:\s*["']([^"']+)["']/);
+                if (m2) return m2[1];
+            }
+        } catch (e) {
+            /* ignore */
+        }
+        return null;
+    }
+    async function getWebApiToken() {
+        // Steam web-api tokens expire: a tab open for hours can keep a dead
+        // token cached, silently making StoreBrowse fail (401) on refresh.
+        if (cachedWebApiToken && Date.now() - (cachedWebApiTokenAt || 0) < TOKEN_TTL_MS) {
+            return cachedWebApiToken;
+        }
+        const domTok = extractTokenFromDom();
+        if (domTok) {
+            cachedWebApiToken = domTok;
+            cachedWebApiTokenAt = Date.now();
+            return cachedWebApiToken;
+        }
+        if (tokenFetchPromise) return tokenFetchPromise;
+        tokenFetchPromise = new Promise((resolve) => {
+            GM_xmlhttpRequest({
+                method: "GET",
+                url: `${location.origin}/pointssummary/ajaxgetasyncconfig`,
+                timeout: STEAM_TIMEOUT_MS,
+                headers: { Accept: "application/json" },
+                onload: function (res) {
+                    try {
+                        const j = JSON.parse(res.responseText);
+                        const tok = j && j.data && (j.data.webapi_token || j.data.webapiToken);
+                        if (tok) {
+                            cachedWebApiToken = tok;
+                            cachedWebApiTokenAt = Date.now();
+                            log("webapi_token acquired via ajaxgetasyncconfig");
+                        } else log("ajaxgetasyncconfig: no token in response");
+                    } catch (e) { log("ajaxgetasyncconfig parse failed", e); }
+                    resolve(cachedWebApiToken || null);
+                },
+                onerror: function () { log("ajaxgetasyncconfig network error"); resolve(null); },
+                ontimeout: function () { log("ajaxgetasyncconfig timeout"); resolve(null); },
+            });
+        });
+        const t = await tokenFetchPromise;
+        tokenFetchPromise = null;
+        return t;
+    }
+
+    // ---------- IStoreBrowseService fetch ----------
+    function browseFetchChunk(appids) {
+        return new Promise(async (resolve) => {
+            const token = await getWebApiToken();
+            if (!token) {
+                resolve({ ok: false, error: "no_token" });
+                return;
+            }
+            const country = getStoreCountry(); // e.g. "ES"
+            const language = getStoreLanguage(); // e.g. "spanish"
+            const payload = buildGetItemsPayload(appids, country, language);
+            const b64 = base64EncodeBytes(payload);
+            const url =
+                "https://api.steampowered.com/IStoreBrowseService/GetItems/v1" +
+                `?access_token=${encodeURIComponent(token)}` +
+                `&input_protobuf_encoded=${encodeURIComponent(b64)}` +
+                `&origin=${encodeURIComponent("https://store.steampowered.com")}`;
+            log(`StoreBrowse request ${appids.length} ids → ${country}/${language} (payload ${payload.length}B)`);
+            GM_xmlhttpRequest({
+                method: "GET",
+                url,
+                timeout: STEAM_TIMEOUT_MS,
+                responseType: "arraybuffer",
+                headers: { Accept: "application/octet-stream" },
+                onload: function (res) {
+                    if (res.status < 200 || res.status >= 300) {
+                        log(`StoreBrowse HTTP ${res.status} for ${appids.length} ids`);
+                        resolve({ ok: false, error: "http_" + res.status });
+                        return;
+                    }
+                    try {
+                        const buf = res.response instanceof ArrayBuffer
+                            ? new Uint8Array(res.response)
+                            : new Uint8Array(res.response || []);
+                        // Some GM implementations return response as string for arraybuffer - fallback
+                        if (buf.length === 0 && res.responseText) {
+                            // try base64? but assume empty means error
+                            resolve({ ok: false, error: "empty" });
+                            return;
+                        }
+                        const items = decodeGetItemsResponse(buf);
+                        resolve({ ok: true, items });
+                    } catch (e) {
+                        console.warn("[WishlistMinPrice] StoreBrowse decode failed", e);
+                        resolve({ ok: false, error: "decode" });
+                    }
+                },
+                onerror: function (e) { log("StoreBrowse network error", e); resolve({ ok: false, error: "network" }); },
+                ontimeout: function () { log("StoreBrowse timeout"); resolve({ ok: false, error: "timeout" }); },
+            });
+        });
+    }
+
+    async function fetchStoreBrowsePrices(appids) {
+        const batchCount = Math.ceil(appids.length / STORE_BROWSE_BATCH_SIZE);
+        const totals = { priced: 0, noPrice: 0, failed: 0, visibleHidden: 0 };
+        const allFailedIds = [];
+        let batchIndex = 0;
+        let anySuccess = false;
+        for (let i = 0; i < appids.length; i += STORE_BROWSE_BATCH_SIZE) {
+            const chunk = appids.slice(i, i + STORE_BROWSE_BATCH_SIZE);
+            batchIndex++;
+            const res = await browseFetchChunk(chunk);
+            let changed = false;
+            if (res.ok && Array.isArray(res.items)) {
+                anySuccess = true;
+                // Freshness marker: entries priced by the API become
+                // authoritative; DOM capture must not overwrite them (panels
+                // on a long-open tab can be stale or mid-swap).
+                const now = Date.now();
+                const stamp = (appid) => {
+                    if (store[appid]) store[appid].apiTs = now;
+                };
+                const pricedIds = [];
+                const noPriceIds = [];
+                const hiddenIds = [];
+                const failedIds = [];
+                // Map by appid string for quick lookup; StoreItem.id may be number
+                const map = new Map();
+                for (const it of res.items) {
+                    const key = String(it.appid ?? it.id ?? "");
+                    if (key) map.set(key, it);
+                }
+                for (const appid of chunk) {
+                    const it = map.get(String(appid));
+                    if (!it) { failedIds.push(appid); continue; }
+                    if (it.success !== 1) {
+                        // StoreItem not found / unavailable
+                        failedIds.push(appid);
+                        continue;
+                    }
+                    const name = it.name;
+                    if (name) {
+                        if ((store[appid] || {}).name !== name) {
+                            store[appid] = { ...(store[appid] || {}), name };
+                            changed = true;
+                        }
+                        if ((store[appid] || {}).is_free !== !!it.isFree) {
+                            store[appid] = { ...(store[appid] || {}), is_free: !!it.isFree };
+                            changed = true;
+                        }
+                    }
+                    if (it.isFree) {
+                        // Free game: treat as priced 0 but counts as noPrice for stats (like AugmentedSteam)
+                        // We keep steamPrice 0 so original/current don't inflate, but stats counts as without price.
+                        if (typeof (store[appid] || {}).steamPrice !== "number") {
+                            changed = updateGamePrice(appid, { steamPrice: 0, steamOriginalPrice: 0, discountPercent: 0, name }) || changed;
+                        }
+                        stamp(appid);
+                        noPriceIds.push(appid);
+                        continue;
+                    }
+                    const po = it.bestPurchaseOption;
+                    if (po && (po.finalPriceInCents != null)) {
+                        // Convert cents -> EUR. finalPriceInCents is int64 cents
+                        const cents = typeof po.finalPriceInCents === "bigint" ? po.finalPriceInCents : BigInt(po.finalPriceInCents);
+                        const final = Number(cents) / 100;
+                        const origCents = po.originalPriceInCents != null ? (typeof po.originalPriceInCents === "bigint" ? po.originalPriceInCents : BigInt(po.originalPriceInCents)) : cents;
+                        const original = Number(origCents) / 100;
+                        const discount = typeof po.discountPct === "number" ? po.discountPct : 0;
+                        // Detect currency symbol from formatted price if present
+                        if (po.formattedFinalPrice) {
+                            const sym = extractCurrencySymbol(po.formattedFinalPrice);
+                            if (sym) currencySymbol = sym;
+                        }
+                        // A price appeared: drop noPrice sentinel
+                        if ((store[appid] || {}).noPrice === true) {
+                            delete store[appid].noPrice;
+                            changed = true;
+                        }
+                        pricedIds.push(appid);
+                        changed = updateGamePrice(appid, { steamPrice: final, steamOriginalPrice: original, discountPercent: discount, name }) || changed;
+                        stamp(appid);
+                        continue;
+                    }
+                    // No purchase option -> without price
+                    // If visible=false but no price, AugmentedSteam counts as hidden (k)
+                    if (it.visible === false) hiddenIds.push(appid);
+                    else noPriceIds.push(appid);
+                    const entry = store[appid] || {};
+                    const clean = { ...entry, noPrice: true };
+                    if (name && !clean.name) clean.name = name;
+                    const hadPrice = clean.steamPrice !== undefined || clean.steamOriginalPrice !== undefined || clean.discountPercent !== undefined || clean.price !== undefined || clean.ts !== undefined;
+                    delete clean.steamPrice; delete clean.steamOriginalPrice; delete clean.discountPercent; delete clean.price; delete clean.ts;
+                    if (hadPrice || entry.noPrice !== true) {
+                        store[appid] = clean;
+                        changed = true;
+                    }
+                    stamp(appid);
+                }
+                totals.priced += pricedIds.length;
+                totals.noPrice += noPriceIds.length;
+                totals.visibleHidden += hiddenIds.length;
+                totals.failed += failedIds.length;
+                allFailedIds.push(...failedIds);
+                log(`StoreBrowse batch ${batchIndex}/${batchCount} → priced:${pricedIds.length} noPrice:${noPriceIds.length} hidden:${hiddenIds.length} failed:${failedIds.length}${failedIds.length ? " " + failedIds.join(",") : ""}`);
+            } else {
+                log(`StoreBrowse batch ${batchIndex}/${batchCount} → request failed (${res.error})`);
+                totals.failed += chunk.length;
+                // Early break on fatal token error? Continue to try other chunks anyway
+                if (res.error === "no_token" || String(res.error).startsWith("http_401") || String(res.error).startsWith("http_403")) {
+                    allFailedIds.push(...chunk);
+                    break;
+                }
+            }
+            if (changed) persistStore();
+            inject();
+        }
+        log(`StoreBrowse totals → priced:${totals.priced} noPrice:${totals.noPrice} hidden:${totals.visibleHidden} failed:${totals.failed} (chunks ${batchCount})`);
+        return { ok: anySuccess, failed: allFailedIds };
+    }
+
     // GM_xmlhttpRequest wrapper with timeout and retries; always resolves
     // {ok, json?, error?}, never throws.
     function steamFetch(url, { retries = 1 } = {}) {
@@ -774,6 +1384,9 @@
     // region-unavailable games return "data":[] (no price_overview); unknown
     // appids come back with success:false and keep their price.
     async function fetchPricesBatch(appids) {
+        const cc = getStoreCountry().toLowerCase();
+        const langFull = getStoreLanguage();
+        const langShort = languageToShort(langFull);
         const batchCount = Math.ceil(appids.length / PRICE_BATCH_SIZE);
         const totals = { priced: 0, noPrice: 0, failed: 0 };
         let batchIndex = 0;
@@ -781,12 +1394,17 @@
             const chunk = appids.slice(i, i + PRICE_BATCH_SIZE);
             batchIndex++;
             const url =
-                `${APPDETAILS_URL}?appids=${chunk.join(",")}&cc=${STEAM_CC}` +
-                `&l=${STEAM_LANG}&filters=price_overview`;
+                `${APPDETAILS_URL}?appids=${chunk.join(",")}&cc=${cc}` +
+                `&l=${langShort}&filters=price_overview`;
             const res = await steamFetch(url, { retries: 1 });
             let changed = false;
 
             if (res.ok && res.json) {
+                // API-priced entries become authoritative (see fetchStoreBrowsePrices).
+                const now = Date.now();
+                const stamp = (appid) => {
+                    if (store[appid]) store[appid].apiTs = now;
+                };
                 const pricedIds = [];
                 const noPriceIds = [];
                 const failedIds = [];
@@ -824,6 +1442,7 @@
                                         ? p.discount_percent
                                         : 0,
                             }) || changed;
+                        stamp(appid);
                         return;
                     }
                     // No price_overview (free, subscription, unreleased,
@@ -843,6 +1462,7 @@
                                     discountPercent: 0,
                                 }) || changed;
                         }
+                        stamp(appid);
                     } else {
                         if (typeof entry.is_free !== "boolean") {
                             queueNameFetch(appid);
@@ -864,6 +1484,7 @@
                             store[appid] = clean;
                             changed = true;
                         }
+                        stamp(appid);
                     }
                 });
                 totals.priced += pricedIds.length;
@@ -906,8 +1527,11 @@
     }
 
     async function fetchName(appid) {
+        const cc = getStoreCountry().toLowerCase();
+        const langFull = getStoreLanguage();
+        const langShort = languageToShort(langFull);
         const url =
-            `${APPDETAILS_URL}?appids=${appid}&cc=${STEAM_CC}&l=${STEAM_LANG}` +
+            `${APPDETAILS_URL}?appids=${appid}&cc=${cc}&l=${langShort}` +
             `&filters=basic`;
         const res = await steamFetch(url, { retries: 1 });
         let changed = false;
@@ -943,12 +1567,18 @@
     }
 
     async function refreshFromApi(steamid) {
+        // Panels on a long-open tab are stale (rendered at page load). While
+        // the API pass runs, DOM capture must not write prices — after a
+        // reset there is no apiTs protection yet and the observer would fill
+        // entries with stale panel values that stick for API-missed games.
+        domCaptureSuppressed = true;
         const items = await fetchWishlist(steamid);
         if (!items) {
             console.warn(
                 "[WishlistMinPrice] Could not read the wishlist via the API " +
                 "(private wishlist or timeout?), falling back to DOM mode",
             );
+            domCaptureSuppressed = false;
             startDomMode();
             tryInject();
             return;
@@ -969,11 +1599,30 @@
         queueAksForStale();
         inject();
 
-        await fetchPricesBatch(appids);
-        // Sweep the virtualized list to capture each game's real minimum
-        // (incl. bundle pricing, which the panels already show); aborts only
-        // if the user scrolls. Games it misses keep the API price.
-        startSweep(appids);
+        // Prefer IStoreBrowseService (like AugmentedSteam, no scroll, correct bundle pricing).
+        // Fallback to appdetails if token missing or request fails.
+        let browseOk = false;
+        let browseFailed = [];
+        try {
+            const browseRes = await fetchStoreBrowsePrices(appids);
+            browseOk = browseRes.ok;
+            browseFailed = browseRes.failed;
+        } catch (e) {
+            log("StoreBrowse exception, falling back to appdetails", e);
+        }
+        if (!browseOk) {
+            log("StoreBrowse failed or no token — falling back to appdetails");
+            await fetchPricesBatch(appids);
+        } else if (browseFailed.length > 0) {
+            // Second authoritative pass for the few items StoreBrowse could
+            // not price (success != 1, not in response): appdetails is fresh
+            // server data, whereas the visible panels can be hours old.
+            log(`appdetails second pass for ${browseFailed.length} StoreBrowse misses: ${browseFailed.join(",")}`);
+            await fetchPricesBatch(browseFailed);
+        }
+        domCaptureSuppressed = false;
+        // Passive DOM capture only (no auto-scroll). MutationObserver already keeps panels in sync.
+        scanVisiblePanels();
         inject();
     }
 
@@ -1099,144 +1748,9 @@
         });
     }
 
-    // ---------- Wishlist sweep (minimum prices incl. bundles) ----------
-    // Each panel shows the real minimum on Steam (own discount + bundle base
-    // when completing a set). The list is virtualized, so we scroll
-    // programmatically to the end to capture all panels, no /bundlelist calls.
-    const SWEEP_STEP_DELAY_MS = 400;
-    const SWEEP_MAX_IDLE_STEPS = 3;
-
-    const sweepState = { active: false, aborted: false, expectedTop: 0 };
-
-    function sleep(ms) {
-        return new Promise((resolve) => setTimeout(resolve, ms));
-    }
-
-    // Waits one sweep step, pausing while the tab is hidden.
-    async function waitSweepStep() {
-        let waited = 0;
-        while (waited < SWEEP_STEP_DELAY_MS) {
-            if (document.hidden) {
-                await sleep(300);
-                continue;
-            }
-            await sleep(Math.min(100, SWEEP_STEP_DELAY_MS - waited));
-            waited += 100;
-        }
-    }
-
-    function getWishlistScroller() {
-        const panel = document.querySelector("div.Panel");
-        if (panel) {
-            let cur = panel.parentElement;
-            while (cur && cur !== document.body && cur !== document.documentElement) {
-                if (cur.scrollHeight > cur.clientHeight + 20) {
-                    const style = window.getComputedStyle(cur);
-                    if (/(auto|scroll)/.test(style.overflowY + style.overflow)) return cur;
-                }
-                cur = cur.parentElement;
-            }
-        }
-        // Fallback: widest scrollable div on the page (new wishlist uses an inner scroller)
-        let best = null;
-        let bestH = 0;
-        document.querySelectorAll("div").forEach((el) => {
-            if (el.scrollHeight > el.clientHeight + 50 && el.clientHeight > 200) {
-                const style = window.getComputedStyle(el);
-                if (/(auto|scroll)/.test(style.overflowY + style.overflow)) {
-                    if (el.scrollHeight > bestH) {
-                        bestH = el.scrollHeight;
-                        best = el;
-                    }
-                }
-            }
-        });
-        return best || document.scrollingElement || document.documentElement;
-    }
-
-    // Scrolls through the virtualized wishlist capturing all panels. Aborts
-    // as soon as the user scrolls (captured data stays; the rest keeps the
-    // API price). Restores the scroll position when done without abort.
-    async function startSweep(appids) {
-        if (sweepState.active || appids.length === 0) return;
-        sweepState.active = true;
-        sweepState.aborted = false;
-
-        const scroller = getWishlistScroller();
-        const isWindowScroller =
-            scroller === document.scrollingElement ||
-            scroller === document.documentElement ||
-            scroller === document.body;
-        const scrollTarget = isWindowScroller ? window : scroller;
-        const getTop = () =>
-            isWindowScroller
-                ? window.scrollY || document.documentElement.scrollTop
-                : scroller.scrollTop;
-        const getMaxTop = () =>
-            isWindowScroller
-                ? document.documentElement.scrollHeight - window.innerHeight
-                : scroller.scrollHeight - scroller.clientHeight;
-        const setTop = (v) => {
-            if (isWindowScroller) {
-                const s = document.scrollingElement || document.documentElement;
-                s.scrollTop = v;
-                window.scrollTo(0, v);
-            } else {
-                scroller.scrollTop = v;
-            }
-        };
-        const initialTop = getTop();
-        sweepState.expectedTop = initialTop;
-        log(
-            `Sweep scroller: ${scroller.className ? "." + scroller.className.split(" ").slice(0,2).join(".") : scroller.tagName} (windowScroller=${isWindowScroller})`,
-        );
-
-        const onScroll = () => {
-            if (Math.abs(getTop() - sweepState.expectedTop) > 4) {
-                sweepState.aborted = true;
-            }
-        };
-        scrollTarget.addEventListener("scroll", onScroll, { passive: true });
-
-        try {
-            scanVisiblePanels();
-            const wanted = new Set(appids);
-            let idleSteps = 0;
-
-            while (
-                !sweepState.aborted &&
-                idleSteps < SWEEP_MAX_IDLE_STEPS &&
-                ![...wanted].every((id) => sessionSeenIds.has(id))
-            ) {
-                const before = sessionSeenIds.size;
-                const maxTop = getMaxTop();
-                const curTop = getTop();
-                const step = isWindowScroller ? window.innerHeight * 0.9 : scroller.clientHeight * 0.9;
-                const target = Math.min(curTop + step, maxTop);
-                sweepState.expectedTop = target;
-                setTop(target);
-                await waitSweepStep();
-                scanVisiblePanels();
-                idleSteps = sessionSeenIds.size === before ? idleSteps + 1 : 0;
-            }
-
-            log(
-                `Sweep finished: ${sessionSeenIds.size}/${appids.length} games captured` +
-                (sweepState.aborted ? " (aborted: you scrolled)" : ""),
-            );
-        } finally {
-            scrollTarget.removeEventListener("scroll", onScroll);
-            if (!sweepState.aborted && getTop() !== initialTop) {
-                setTop(initialTop);
-            }
-            sweepState.active = false;
-            inject();
-        }
-    }
-
-    // Scans the currently rendered .Panel elements (Steam virtualizes them
-    // on scroll): captures Steam's sale + original prices from the DOM and
-    // queues an AllKeyShop lookup by name when our price is stale.
+    // Scans the currently rendered .Panel elements (Steam virtualizes them):
+    // passively captures Steam's sale + original prices from the DOM (no scrolling)
+    // and queues an AllKeyShop lookup by name when our price is stale.
     function scanVisiblePanels() {
         const panels = document.querySelectorAll("div.Panel");
         let changed = false;
@@ -1277,7 +1791,16 @@
                     log("capture", appid, `"${name}"`, "tag:", prices.discounted, "badge:", badgePercent);
                 }
                 const isNoPrice = entryForPanel.noPrice === true;
-                if (!isNoPrice) {
+                // Fresh API data (IStoreBrowseService / appdetails) is
+                // authoritative: on a long-open tab the panels can be stale
+                // (a sale may have ended server-side since page load) or
+                // mid-swap during virtualization, so DOM capture only fills
+                // gaps and never overwrites a fresh API price. During an
+                // in-flight refresh (post-reset) DOM writes pause entirely.
+                const apiFresh =
+                    typeof entryForPanel.apiTs === "number" &&
+                    Date.now() - entryForPanel.apiTs < MAX_AGE_MS;
+                if (!apiFresh && !isNoPrice && !domCaptureSuppressed) {
                     if (prices.discounted !== null) {
                         update.steamPrice = prices.discounted;
                         if (prices.original !== null) {
@@ -1385,7 +1908,7 @@
                     typeof entry.discountPercent === "number"
                         ? entry.discountPercent > 0
                         : typeof entry.steamOriginalPrice === "number" &&
-                          entry.steamOriginalPrice > entry.steamPrice + 0.005;
+                        entry.steamOriginalPrice > entry.steamPrice + 0.005;
                 if (onSale) onSaleCount++;
 
                 if (typeof entry.steamOriginalPrice === "number") {
@@ -1436,9 +1959,9 @@
             "background:rgba(255,255,255,.15)}" +
             ".tm-min-bar .tm-min-reset{cursor:pointer;opacity:.6;margin-left:2px;" +
             "transition:opacity .15s ease;background:none;border:none;padding:0;" +
-            "font:inherit;color:inherit;line-height:1}"+
-            ".tm-min-bar .tm-min-reset:hover{opacity:1}"+
-            ".tm-min-bar .tm-min-reset:focus{outline:1px solid #1a9fff;outline-offset:2px}"+
+            "font:inherit;color:inherit;line-height:1}" +
+            ".tm-min-bar .tm-min-reset:hover{opacity:1}" +
+            ".tm-min-bar .tm-min-reset:focus{outline:1px solid #1a9fff;outline-offset:2px}" +
             ".tm-min-bar .tm-min-reset:focus:not(:focus-visible){outline:none}";
         document.head.appendChild(style);
     }
@@ -1514,29 +2037,32 @@
             minLabelText.className = "tm-min-label-text";
             minLabel.appendChild(minLabelText);
 
-            // Small reset button so the cache can be cleared without the console
+            // Small reset button so the cache can be cleared without the console.
+            // Left click: reloads the page (clean, verified refresh path).
+            // Middle click (auxclick): refresh in place.
             const resetBtn = document.createElement("button");
             resetBtn.type = "button";
             resetBtn.className = "tm-min-reset";
             resetBtn.textContent = "⟲";
-            resetBtn.title = "Clear cached prices (keeps game names)";
+            resetBtn.title =
+                "Refresh prices (reloads the page; middle-click refreshes in place)";
             resetBtn.setAttribute("aria-label", "Clear cached prices");
-            const doReset = (e) => {
+            const doReset = (e, mode) => {
                 e.stopPropagation();
                 e.preventDefault();
                 const ok =
                     typeof unsafeWindow.confirm === "function"
                         ? unsafeWindow.confirm(
-                              "Clear the prices and query again? Game names are kept.",
-                          )
+                            "Clear the prices and query again? Game names are kept.",
+                        )
                         : confirm("Clear the prices and query again? Game names are kept.");
                 if (ok) {
                     console.log("[WishlistMinPrice] Reset clicked");
-                    resetCache();
+                    resetCache({ reload: mode !== "inplace" });
                 }
             };
-            resetBtn.addEventListener("click", doReset);
-            resetBtn.addEventListener("auxclick", doReset);
+            resetBtn.addEventListener("click", (e) => doReset(e, "reload"));
+            resetBtn.addEventListener("auxclick", (e) => doReset(e, "inplace"));
             minLabel.appendChild(resetBtn);
 
             min.group.appendChild(minLabel);
@@ -1672,10 +2198,9 @@
             characterData: true,
         });
 
-        // Panel capture runs in both modes: the sweep grabs everything
-        // upfront, but the observer also catches prices (incl. bundle deals)
-        // as panels render during normal browsing — with the API as the
-        // fallback for anything never painted on screen.
+        // Passive panel capture (no scrolling). IStoreBrowseService already provides
+        // the correct price incl. bundles; the observer only supplements names/AKS
+        // as panels render during normal browsing.
         scanObserver.observe(document.body, {
             childList: true,
             subtree: true,
