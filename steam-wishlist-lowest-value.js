@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Steam Wishlist Lowest Value
 // @namespace    http://tampermonkey.net/
-// @version      4.0
+// @version      5.0
 // @description  Shows three totals for your wishlist in Steam's native controls bar: minimum value (Steam's real prices via IStoreBrowseService/GetItems like AugmentedSteam, compared with AllKeyShop's lowest offer), current value and original value, plus wishlist stats. Prices come from IStoreBrowseService/GetItems (protobuf, no scrolling) with appdetails/DOM as fallback; DOM scraping is passive only.
 // @author       Menosuno02
 // @match        https://store.steampowered.com/wishlist/*
@@ -47,11 +47,31 @@
 
     const POLL_INTERVAL_MS = 100;
 
-    // Delay between AllKeyShop API calls (undocumented endpoint; raise if
-    // blocked, lower if in a hurry).
-    const AKS_REQUEST_DELAY_MS = 45;
+    // Reload strategy after a reset (left-click ⟲): refresh runs in place
+    // and a single final reload fires once price updates have been quiet
+    // for QUIESCENCE_MS AND all queues are empty (StoreBrowse/appdetails/
+    // names/AKS done). One-shot per reset via a GM timestamp flag so it can
+    // never loop.
+    //   Sizing: AKS is serial (AKS_REQUEST_DELAY_MS + ~200-500ms network per
+    //   game), so the watchdog scales with wishlist size (see
+    //   autoReloadWatchdogMs); the flag expires after AUTO_RELOAD_MAX_AGE_MS
+    //   so a crash before disarm can't cause a surprise reload weeks later.
+    const QUIESCENCE_MS = 8000;
+    const AUTO_RELOAD_MAX_WAIT_MS = 5 * 60 * 1000; // base; scaled up per game
+    const AUTO_RELOAD_MAX_AGE_MS = 15 * 60 * 1000; // stale flags ignored
+    const AUTO_RELOAD_KEY_PREFIX = "wishlistAutoReloadArmed::";
+
+    // Delay between AllKeyShop API calls (undocumented endpoint; the tail
+    // of long queues gets rate-limited below ~100ms, so keep headroom).
+    const AKS_REQUEST_DELAY_MS = 200;
+    const AKS_TIMEOUT_MS = 15000;
     // Failed requests retry sooner (5 min) — likely a temporary block.
     const AKS_ERROR_RETRY_MS = 5 * 60 * 1000; // 5 min
+    // Backoff when the endpoint starts refusing: after this many consecutive
+    // non-JSON responses, pause the whole queue for AKS_BLOCK_PAUSE_MS
+    // (lets the rate window cool down) instead of burning through the tail.
+    const AKS_BLOCK_STREAK = 2;
+    const AKS_BLOCK_PAUSE_MS = 60 * 1000; // 60 s
     const AKS_API_URL =
         "https://www.allkeyshop.com/api/v2-1-250304/vakrs_extension.php";
     const AKS_STATIC_PARAMS =
@@ -67,6 +87,14 @@
     let apiMode = false; // API responded successfully
     let apiWishlistTotal = null; // wishlist size per API (coverage)
     let domModeStarted = false; // only started if the API fails
+    // Authoritative wishlist membership (API mode only): appids returned by
+    // IWishlistService. DOM scans must ignore panels for any other appid —
+    // Steam renders non-wishlist game cards (recommendations, popular strips)
+    // as div.Panel too, and their links often glue title+price into one
+    // textContent (e.g. "Clive Barker's Hellraiser: Revival39,99€"). Without
+    // this guard those cards inject phantom entries (with prices!) into the
+    // store, inflating totals and wasting AKS queue turns.
+    const knownWishlistIds = new Set();
     // True while an API refresh is in flight: panels can be stale on a
     // long-open tab, so price capture from the DOM waits until the API pass
     // has stamped fresh entries (apiTs) or definitively failed.
@@ -75,9 +103,36 @@
     const pendingAksFetch = new Set();
     const aksQueue = [];
     let aksQueueBusy = false;
+    // Consecutive non-JSON AKS responses (rate-limit signal). At
+    // AKS_BLOCK_STREAK the queue pauses for AKS_BLOCK_PAUSE_MS; any success
+    // resets the streak. Exposed in __wishlistMinPriceAutoReload for tests.
+    let aksBlockStreak = 0;
+    let aksBlockPauseUntil = 0;
+    let aksPauseTimer = null;
+    // Test hook override for the block pause (see
+    // __wishlistMinPriceTestAksBlockPause); 0 = use AKS_BLOCK_PAUSE_MS.
+    let aksBlockPauseMsOverride = 0;
+    function aksBlockPauseMs() {
+        return aksBlockPauseMsOverride > 0
+            ? aksBlockPauseMsOverride
+            : AKS_BLOCK_PAUSE_MS;
+    }
     const pendingNameFetch = new Set();
     const nameQueue = [];
     let nameQueueActive = 0;
+
+    // One-shot post-reset auto-reload: armed by resetCache({reload:true}),
+    // consumed by the single final reload (or by the scaled watchdog).
+    // resetGeneration invalidates in-flight fetchName/AKS callbacks that
+    // started before the latest resetCache so they can't resurrect stale
+    // prices or corrupt the (already cleared) queue counters.
+    let autoReloadArmed = false;
+    let autoReloadFired = false;
+    let lastPriceChangeTs = 0;
+    let quiescenceTimer = null;
+    let autoReloadWatchdog = null;
+    let autoReloadWatchdogUntil = 0;
+    let resetGeneration = 0;
 
     // ---------- Diagnostics ----------
     // All diagnostic output uses the [WMP] prefix so it can be filtered in
@@ -115,12 +170,252 @@
         try {
             GM_setValue(storageKey, JSON.stringify(store));
         } catch (e) {
-            console.warn("[WishlistMinPrice] Could not save the cache", e);
+            console.warn("[WMP] Could not save the cache", e);
         }
+        // Any persisted mutation pushes the "end of refresh" further out.
+        notePriceActivity();
+    }
+
+    // ---------- Post-reset auto-reload (quiescence) ----------
+    function getAutoReloadKey(steamid) {
+        return AUTO_RELOAD_KEY_PREFIX + steamid;
+    }
+
+    function doPageReload() {
+        try {
+            if (
+                typeof unsafeWindow !== "undefined" &&
+                unsafeWindow.location &&
+                typeof unsafeWindow.location.reload === "function"
+            ) {
+                unsafeWindow.location.reload();
+                return;
+            }
+        } catch (e) {
+            /* fall through */
+        }
+        try {
+            location.reload();
+        } catch (e) {
+            try {
+                if (
+                    typeof unsafeWindow !== "undefined" &&
+                    unsafeWindow.location
+                ) {
+                    unsafeWindow.location.href = unsafeWindow.location.href;
+                }
+            } catch (e2) {
+                /* ignore */
+            }
+        }
+    }
+
+    function isAksStale(entry) {
+        if (!entry || !entry.aksTs) return true;
+        const retryWindow =
+            entry.aksStatus === "error" ? AKS_ERROR_RETRY_MS : MAX_AGE_MS;
+        return Date.now() - entry.aksTs > retryWindow;
+    }
+
+    // A name corrected by StoreBrowse/basic may invalidate an earlier AKS
+    // query (or miss) issued with the stale name: retry once with the new
+    // name when we still lack an AKS price.
+    function maybeRequeueAksAfterRename(appid, newName, nameChanged) {
+        if (!nameChanged || !newName) return;
+        if (pendingAksFetch.has(appid)) return; // in-flight uses old name; onloadend retries (see processAksQueue)
+        const entry = store[appid];
+        if (!entry || typeof entry.aksPrice === "number") return;
+        queueAksFetch(appid, newName);
+        log(`aks re-queue after rename ${appid} → "${newName}"`);
+    }
+
+    function notePriceActivity() {
+        if (!autoReloadArmed || autoReloadFired) return;
+        lastPriceChangeTs = Date.now();
+        scheduleQuiescenceCheck();
+    }
+
+    function scheduleQuiescenceCheck() {
+        try {
+            if (quiescenceTimer) clearTimeout(quiescenceTimer);
+        } catch (e) {
+            /* ignore */
+        }
+        quiescenceTimer = null;
+        if (!autoReloadArmed || autoReloadFired) return;
+        quiescenceTimer = setTimeout(checkQuiescenceAndReload, QUIESCENCE_MS);
+    }
+
+    function queuesBusy() {
+        // NOTE: scanTimeout/injectTimeout debounces are deliberately NOT
+        // part of this check. A pending scan debounce means "the DOM changed
+        // recently", not "prices will change" — scanVisiblePanels only
+        // persists (and re-arms quiescence via notePriceActivity) when it
+        // actually finds new data. Gating the final reload on the debounce
+        // caused an infinite "still working" loop: the timer id never reset
+        // to null, and other extensions keep mutating the page anyway.
+        return (
+            domCaptureSuppressed ||
+            aksQueueBusy ||
+            aksQueue.length > 0 ||
+            pendingAksFetch.size > 0 ||
+            pendingNameFetch.size > 0 ||
+            nameQueue.length > 0 ||
+            nameQueueActive > 0
+        );
+    }
+
+    function disarmAutoReload(steamid, reason) {
+        autoReloadArmed = false;
+        autoReloadWatchdogUntil = 0;
+        try {
+            if (quiescenceTimer) clearTimeout(quiescenceTimer);
+        } catch (e) {
+            /* ignore */
+        }
+        quiescenceTimer = null;
+        try {
+            if (autoReloadWatchdog) clearTimeout(autoReloadWatchdog);
+        } catch (e) {
+            /* ignore */
+        }
+        autoReloadWatchdog = null;
+        if (steamid) {
+            try {
+                if (typeof GM_deleteValue === "function") {
+                    GM_deleteValue(getAutoReloadKey(steamid));
+                } else {
+                    GM_setValue(getAutoReloadKey(steamid), "");
+                }
+            } catch (e) {
+                /* ignore */
+            }
+        }
+        if (reason) log(`auto-reload disarmed (${reason})`);
+    }
+
+    // Flag value is a JSON timestamp {t:<ms>} ("1" accepted as legacy =
+    // fresh). Returns the timestamp or null when absent/stale/invalid.
+    function readAutoReloadFlag(steamid) {
+        if (!steamid) return null;
+        let raw = null;
+        try {
+            raw = GM_getValue(getAutoReloadKey(steamid), "");
+        } catch (e) {
+            return null;
+        }
+        if (raw === "1") return Date.now(); // legacy v4.1 flag: honor once
+        if (!raw) return null;
+        try {
+            const parsed = JSON.parse(raw);
+            const t = parsed && typeof parsed.t === "number" ? parsed.t : null;
+            if (!t) return null;
+            if (Date.now() - t > AUTO_RELOAD_MAX_AGE_MS) {
+                try {
+                    if (typeof GM_deleteValue === "function") {
+                        GM_deleteValue(getAutoReloadKey(steamid));
+                    }
+                } catch (e) {
+                    /* ignore */
+                }
+                log("auto-reload: ignoring stale flag (older than 15min)");
+                return null;
+            }
+            return t;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // Watchdog scales with wishlist size: the AKS queue is serial
+    // (AKS_REQUEST_DELAY_MS + network RTT per game), so a fixed 5min gives
+    // up on legitimately large wishlists. 2s/game is generous headroom.
+    function autoReloadWatchdogMs() {
+        const n =
+            typeof apiWishlistTotal === "number" && apiWishlistTotal > 0
+                ? apiWishlistTotal
+                : 0;
+        return Math.max(AUTO_RELOAD_MAX_WAIT_MS, 60000 + n * 2000);
+    }
+
+    function refreshAutoReloadWatchdog(steamid) {
+        if (!autoReloadArmed || autoReloadFired || !steamid) return;
+        try {
+            if (autoReloadWatchdog) clearTimeout(autoReloadWatchdog);
+        } catch (e) {
+            /* ignore */
+        }
+        const ms = autoReloadWatchdogMs();
+        autoReloadWatchdogUntil = Date.now() + ms;
+        autoReloadWatchdog = setTimeout(() => {
+            if (!autoReloadArmed || autoReloadFired) return;
+            disarmAutoReload(steamid, "max wait expired, giving up (no reload)");
+        }, ms);
+    }
+
+    function checkQuiescenceAndReload() {
+        quiescenceTimer = null;
+        if (!autoReloadArmed || autoReloadFired) return;
+        if (queuesBusy()) {
+            log(
+                `auto-reload: still working (aksQueue=${aksQueue.length} busy=${aksQueueBusy} pendingAks=${pendingAksFetch.size} pendingNames=${pendingNameFetch.size} nameActive=${nameQueueActive} domSuppressed=${domCaptureSuppressed} scanPending=${scanTimeout !== null}) — waiting ${QUIESCENCE_MS}ms more`,
+            );
+            scheduleQuiescenceCheck();
+            return;
+        }
+        const idleMs = Date.now() - (lastPriceChangeTs || Date.now());
+        if (idleMs < QUIESCENCE_MS) {
+            quiescenceTimer = setTimeout(
+                checkQuiescenceAndReload,
+                QUIESCENCE_MS - idleMs,
+            );
+            return;
+        }
+        // Quiet + idle queues = end of the refresh. Disarm BEFORE reloading
+        // so the fresh page can never loop.
+        const steamid = resolveSteamId();
+        // Multi-tab race: the flag is shared GM storage but armed/fired is
+        // per-tab. Re-check the flag — if a sibling tab already consumed it
+        // (final reload), stand down instead of duplicating the reload.
+        if (readAutoReloadFlag(steamid) === null) {
+            autoReloadArmed = false;
+            log("auto-reload: flag already consumed (sibling tab?), standing down");
+            return;
+        }
+        autoReloadFired = true;
+        disarmAutoReload(steamid, "quiescence reached");
+        persistStore();
+        log(
+            `auto-reload: no price changes for ${QUIESCENCE_MS}ms and queues empty — final reload for true totals`,
+        );
+        doPageReload();
+    }
+
+    function armAutoReload(steamid) {
+        if (!steamid || autoReloadFired) return;
+        autoReloadArmed = true;
+        lastPriceChangeTs = Date.now();
+        try {
+            GM_setValue(
+                getAutoReloadKey(steamid),
+                JSON.stringify({ t: Date.now() }),
+            );
+        } catch (e) {
+            /* ignore */
+        }
+        log(
+            `auto-reload armed (final reload after ${QUIESCENCE_MS}ms quiet, key=${getAutoReloadKey(steamid)})`,
+        );
+        scheduleQuiescenceCheck();
+        refreshAutoReloadWatchdog(steamid);
     }
 
     function resetCache({ reload = true } = {}) {
         // Drop prices but keep names, then trigger a full refresh.
+        // Bump the generation first so in-flight fetchName/AKS callbacks
+        // from before the reset drop their results instead of resurrecting
+        // stale prices (see fetchName/processAksQueue guards).
+        resetGeneration++;
         Object.keys(store).forEach((id) => {
             const { name, is_free } = store[id];
             store[id] = {};
@@ -129,26 +424,56 @@
         });
         pendingAksFetch.clear();
         aksQueue.length = 0;
+        aksQueueBusy = false;
+        aksBlockStreak = 0;
+        aksBlockPauseUntil = 0;
+        try {
+            if (aksPauseTimer) clearTimeout(aksPauseTimer);
+        } catch (e) {
+            /* ignore */
+        }
+        aksPauseTimer = null;
         pendingNameFetch.clear();
         nameQueue.length = 0;
+        nameQueueActive = 0;
         domSnapshot.clear();
         persistStore();
         log(`resetCache: cleared entries (names kept, key=${storageKey}, left=${Object.keys(store).length})`);
 
         const steamid = resolveSteamId();
         if (steamid && reload) {
-            // The in-place pass can pick up stale panel prices for items the
-            // APIs miss (panels were rendered at page load, hours ago). A
-            // fresh page re-renders everything with current data — init()
-            // then runs the full refresh. This is the path that shows the
-            // right totals (verified on manual reload).
-            log("reset: reloading the page to refresh with clean data");
-            setTimeout(() => {
-                location.reload();
-            }, 80);
+            // Full refresh in place, then exactly one final reload when the
+            // refresh goes quiet (QUIESCENCE_MS with empty queues). Stale
+            // panels on a long-open tab can't contaminate API-priced games
+            // (domCaptureSuppressed during the pass, apiTs authority,
+            // appdetails second pass, non-wishlist guard) — and the final
+            // reload lands on fresh panels anyway. Explicit user reset always
+            // re-arms (clear a previous firing in this same context).
+            autoReloadFired = false;
+            armAutoReload(steamid);
+            log("reset: refreshing in place, final reload when quiet");
+            refreshFromApi(steamid);
         } else if (steamid) {
+            // Explicit in-place refresh: never auto-reload afterwards.
+            disarmAutoReload(steamid, "in-place reset (no reload requested)");
             refreshFromApi(steamid);
         } else {
+            // No steamid: nothing to arm against (flag keys are per-steamid),
+            // make sure no stale local arming survives in this context.
+            autoReloadArmed = false;
+            autoReloadWatchdogUntil = 0;
+            try {
+                if (quiescenceTimer) clearTimeout(quiescenceTimer);
+            } catch (e) {
+                /* ignore */
+            }
+            quiescenceTimer = null;
+            try {
+                if (autoReloadWatchdog) clearTimeout(autoReloadWatchdog);
+            } catch (e) {
+                /* ignore */
+            }
+            autoReloadWatchdog = null;
             startDomMode();
             tryInject();
         }
@@ -304,6 +629,52 @@
     unsafeWindow.__wishlistMinPriceVerbose = function (on = true) {
         verboseCapture = Boolean(on);
         log(`verbose capture ${verboseCapture ? "ON" : "OFF"}`);
+    };
+
+    // Diagnostics: one-shot post-reset auto-reload state (armed/fired,
+    // idle time, queue depths). Helps verify the quiescence reload fires
+    // once and never loops.
+    unsafeWindow.__wishlistMinPriceAutoReload = function () {
+        let flag = null;
+        try {
+            flag = GM_getValue(
+                getAutoReloadKey(resolveSteamId()),
+                "",
+            );
+        } catch (e) {
+            flag = null;
+        }
+        const state = {
+            armed: autoReloadArmed,
+            fired: autoReloadFired,
+            flag: flag || "(none)",
+            idleMs: lastPriceChangeTs ? Date.now() - lastPriceChangeTs : null,
+            quiescenceMs: QUIESCENCE_MS,
+            timerPending: quiescenceTimer !== null,
+            watchdogRemainingMs: autoReloadWatchdogUntil
+                ? Math.max(0, autoReloadWatchdogUntil - Date.now())
+                : 0,
+            aksQueue: aksQueue.length,
+            aksBusy: aksQueueBusy,
+            pendingAks: pendingAksFetch.size,
+            pendingNames: pendingNameFetch.size,
+            nameQueue: nameQueue.length,
+            nameActive: nameQueueActive,
+            domSuppressed: domCaptureSuppressed,
+            scanPending: scanTimeout !== null,
+            aksBlockStreak,
+            aksPaused: Date.now() < aksBlockPauseUntil,
+        };
+        log(
+            `auto-reload state → armed=${state.armed} fired=${state.fired} flag=${state.flag} idleMs=${state.idleMs} queues(aks=${state.aksQueue}/${state.pendingAks} names=${state.nameQueue}/${state.pendingNames})`,
+        );
+        return state;
+    };
+
+    // Test-only: shrink the rate-limit pause (default 60s) so tests don't
+    // wait a minute. Pass 0/negative to restore the production value.
+    unsafeWindow.__wishlistMinPriceTestAksBlockPause = function (ms) {
+        aksBlockPauseMsOverride = typeof ms === "number" && ms > 0 ? ms : 0;
     };
 
     // Diagnostics: which entries were priced by the API (authoritative) and
@@ -1176,7 +1547,7 @@
                         const items = decodeGetItemsResponse(buf);
                         resolve({ ok: true, items });
                     } catch (e) {
-                        console.warn("[WishlistMinPrice] StoreBrowse decode failed", e);
+                        console.warn("[WMP] StoreBrowse decode failed", e);
                         resolve({ ok: false, error: "decode" });
                     }
                 },
@@ -1226,7 +1597,9 @@
                     }
                     const name = it.name;
                     if (name) {
-                        if ((store[appid] || {}).name !== name) {
+                        const nameChanged =
+                            (store[appid] || {}).name !== name;
+                        if (nameChanged) {
                             store[appid] = { ...(store[appid] || {}), name };
                             changed = true;
                         }
@@ -1234,6 +1607,10 @@
                             store[appid] = { ...(store[appid] || {}), is_free: !!it.isFree };
                             changed = true;
                         }
+                        // The AKS lookup may already have run (or be running)
+                        // with the stale cached name: retry once with the
+                        // authoritative StoreBrowse name when AKS is missing.
+                        maybeRequeueAksAfterRename(appid, name, nameChanged);
                     }
                     if (it.isFree) {
                         // Free game: treat as priced 0 but counts as noPrice for stats (like AugmentedSteam)
@@ -1321,7 +1698,7 @@
                             json = JSON.parse(res.responseText);
                         } catch (e) {
                             console.warn(
-                                "[WishlistMinPrice] Non-JSON response from Steam:",
+                                "[WMP] Non-JSON response from Steam:",
                                 url,
                             );
                         }
@@ -1335,7 +1712,7 @@
                     },
                     onerror: function (err) {
                         console.warn(
-                            "[WishlistMinPrice] Network error with Steam:",
+                            "[WMP] Network error with Steam:",
                             url,
                             err,
                         );
@@ -1346,7 +1723,7 @@
                         }
                     },
                     ontimeout: function () {
-                        console.warn("[WishlistMinPrice] Steam timeout:", url);
+                        console.warn("[WMP] Steam timeout:", url);
                         if (remaining > 0) {
                             setTimeout(() => attempt(remaining - 1), STEAM_RETRY_DELAY_MS);
                         } else {
@@ -1378,6 +1755,34 @@
             }
         });
         if (changed) persistStore();
+    }
+
+    // Safety net against phantom entries injected mid-session by
+    // non-wishlist panels (see scanVisiblePanels guard): deletes (and
+    // un-queues AKS for) any cached id outside the authoritative wishlist.
+    // No-op in DOM mode, where membership is unknown.
+    function pruneNonWishlistEntries() {
+        if (!apiMode || knownWishlistIds.size === 0) return false;
+        let changed = false;
+        Object.keys(store).forEach((id) => {
+            if (!knownWishlistIds.has(id)) {
+                delete store[id];
+                sessionSeenIds.delete(id);
+                domSnapshot.delete(id);
+                changed = true;
+            }
+        });
+        if (changed) {
+            for (let i = aksQueue.length - 1; i >= 0; i--) {
+                if (!knownWishlistIds.has(aksQueue[i].appid)) {
+                    pendingAksFetch.delete(aksQueue[i].appid);
+                    aksQueue.splice(i, 1);
+                }
+            }
+            persistStore();
+            log("pruned phantom entries outside the wishlist");
+        }
+        return changed;
     }
 
     // Prices for all games in a few calls (filters=price_overview). Free or
@@ -1518,15 +1923,20 @@
     function processNameQueue() {
         while (nameQueueActive < NAME_FETCH_CONCURRENCY && nameQueue.length > 0) {
             const appid = nameQueue.shift();
+            const gen = resetGeneration;
             nameQueueActive++;
-            fetchName(appid).finally(() => {
-                nameQueueActive--;
+            fetchName(appid, gen).finally(() => {
+                // A reset zeroed the counter already: stale flights must not
+                // drive it negative (that would permanently raise the
+                // effective concurrency above NAME_FETCH_CONCURRENCY).
+                if (gen !== resetGeneration) return;
+                nameQueueActive = Math.max(0, nameQueueActive - 1);
                 processNameQueue();
             });
         }
     }
 
-    async function fetchName(appid) {
+    async function fetchName(appid, gen) {
         const cc = getStoreCountry().toLowerCase();
         const langFull = getStoreLanguage();
         const langShort = languageToShort(langFull);
@@ -1534,6 +1944,12 @@
             `${APPDETAILS_URL}?appids=${appid}&cc=${cc}&l=${langShort}` +
             `&filters=basic`;
         const res = await steamFetch(url, { retries: 1 });
+        // Reset happened while this request was in flight: drop the result
+        // instead of resurrecting pre-reset data and re-queueing AKS for it.
+        if (gen !== resetGeneration) {
+            pendingNameFetch.delete(appid);
+            return;
+        }
         let changed = false;
 
         const info = res.ok && res.json ? res.json[appid] : null;
@@ -1555,7 +1971,7 @@
                     }) || changed;
             }
         } else {
-            console.warn("[WishlistMinPrice] No Steam basic data for", appid);
+            console.warn("[WMP] No Steam basic data for", appid);
         }
 
         pendingNameFetch.delete(appid);
@@ -1575,10 +1991,17 @@
         const items = await fetchWishlist(steamid);
         if (!items) {
             console.warn(
-                "[WishlistMinPrice] Could not read the wishlist via the API " +
+                "[WMP] Could not read the wishlist via the API " +
                 "(private wishlist or timeout?), falling back to DOM mode",
             );
             domCaptureSuppressed = false;
+            // A resumed post-reset arming expects an API refresh; the DOM
+            // fallback needs no final reload (panels are already fresh).
+            disarmAutoReload(steamid, "api failed, DOM fallback needs no final reload");
+            // Membership unknown in DOM mode: clear any stale set so the
+            // scan guard (API mode only) can't wrongly filter panels.
+            knownWishlistIds.clear();
+            apiWishlistTotal = null;
             startDomMode();
             tryInject();
             return;
@@ -1588,8 +2011,20 @@
         const appids = items.map((i) => String(i.appid));
         apiWishlistTotal = appids.length;
         log(`wishlist API ok: ${appids.length} games`);
+        // Wishlist size is now known: scale the auto-reload watchdog so
+        // large wishlists (serial AKS queue) don't hit the base timeout.
+        refreshAutoReloadWatchdog(steamid);
+
+        // Authoritative membership for the DOM-scan guard (see
+        // knownWishlistIds): rebuilt on every successful refresh.
+        knownWishlistIds.clear();
+        appids.forEach((id) => knownWishlistIds.add(id));
 
         reconcileCache(appids);
+        // Belt and braces: drop phantom entries created by non-wishlist
+        // panels scanned before this refresh (reconcile covers cache
+        // staleness; this covers scan-created extras mid-session).
+        pruneNonWishlistEntries();
 
         // New games (no known name yet): one basic call each.
         appids.forEach((appid) => {
@@ -1623,6 +2058,7 @@
         domCaptureSuppressed = false;
         // Passive DOM capture only (no auto-scroll). MutationObserver already keeps panels in sync.
         scanVisiblePanels();
+        pruneNonWishlistEntries();
         inject();
     }
 
@@ -1633,10 +2069,7 @@
             const name =
                 entry && typeof entry.name === "string" ? entry.name.trim() : "";
             if (!name) return;
-            const retryWindow =
-                entry.aksStatus === "error" ? AKS_ERROR_RETRY_MS : MAX_AGE_MS;
-            const aksIsStale = !entry.aksTs || Date.now() - entry.aksTs > retryWindow;
-            if (aksIsStale) queueAksFetch(appid, name);
+            if (isAksStale(entry)) queueAksFetch(appid, name);
         });
     }
 
@@ -1653,8 +2086,38 @@
         processAksQueue();
     }
 
+    // Rate-limit bookkeeping: call with true on a healthy (valid-JSON)
+    // response, false on a block signal (non-JSON body, HTTP 429/403/503).
+    // After AKS_BLOCK_STREAK consecutive blocks the queue pauses for
+    // aksBlockPauseMs() so the tail isn't burned through while limited.
+    function noteAksResult(blocked, gameName) {
+        if (!blocked) {
+            aksBlockStreak = 0;
+            return;
+        }
+        aksBlockStreak++;
+        if (aksBlockStreak >= AKS_BLOCK_STREAK) {
+            aksBlockStreak = 0;
+            aksBlockPauseUntil = Date.now() + aksBlockPauseMs();
+            log(
+                `AKS rate-limited (${gameName || "?"}) — pausing queue for ${Math.round(aksBlockPauseMs() / 1000)}s to cool down`,
+            );
+        }
+    }
+
     function processAksQueue() {
         if (aksQueueBusy || aksQueue.length === 0) return;
+        // Rate-limit backoff: while paused, park a single wakeup timer
+        // instead of firing requests into the block.
+        if (Date.now() < aksBlockPauseUntil) {
+            if (!aksPauseTimer) {
+                aksPauseTimer = setTimeout(() => {
+                    aksPauseTimer = null;
+                    processAksQueue();
+                }, aksBlockPauseUntil - Date.now());
+            }
+            return;
+        }
         aksQueueBusy = true;
 
         const { appid, gameName } = aksQueue.shift();
@@ -1664,23 +2127,70 @@
             setTimeout(processAksQueue, AKS_REQUEST_DELAY_MS);
             return;
         }
+        // If StoreBrowse/basic corrects the name while this request is in
+        // flight (it was queued with the stale name), retry once with the new
+        // name after this request settles. Consumed in finish() (pending is
+        // still held during onload, so re-queueing there would be blocked).
+        let retryWithName = null;
+        let settled = false;
+        const gen = resetGeneration;
+        const computeRenameRetry = () => {
+            const currentName =
+                store[appid] && typeof store[appid].name === "string"
+                    ? store[appid].name.trim()
+                    : "";
+            if (
+                currentName &&
+                currentName !== gameName &&
+                typeof store[appid].aksPrice !== "number"
+            ) {
+                retryWithName = currentName;
+            }
+        };
+        // Single choke point: releases the queue slot exactly once no matter
+        // which callback fires (onload+onloadend, onerror±onloadend,
+        // ontimeout). Without this, one hung/failed request stalls the whole
+        // serial queue (busy=true forever) and quiescence never fires.
+        const finish = () => {
+            if (settled) return;
+            settled = true;
+            pendingAksFetch.delete(appid);
+            aksQueueBusy = false;
+            setTimeout(processAksQueue, AKS_REQUEST_DELAY_MS);
+            if (gen === resetGeneration && retryWithName) {
+                const nameToRetry = retryWithName;
+                retryWithName = null;
+                log(`aks retry after mid-flight rename ${appid} → "${nameToRetry}"`);
+                queueAksFetch(appid, nameToRetry);
+            } else {
+                retryWithName = null;
+            }
+        };
         const url = buildAksUrl(gameName);
-        console.debug(
-            "[WishlistMinPrice] Querying AllKeyShop:",
-            gameName,
-            "\n",
-            url,
-        );
+        if (verboseCapture) {
+            console.debug("[WMP] Querying AllKeyShop:", gameName, "\n", url);
+        } else {
+            console.debug("[WMP] Querying AllKeyShop:", gameName);
+        }
 
         GM_xmlhttpRequest({
             method: "GET",
             url,
+            timeout: AKS_TIMEOUT_MS,
             headers: {
                 Accept: "application/json",
                 Referer: "https://www.allkeyshop.com/",
             },
             onload: function (res) {
+                // Stale flight (reset happened mid-request): advance the
+                // queue but don't write pre-reset results into the store.
+                if (gen !== resetGeneration) return;
                 let conclusive = false;
+                // Explicit refuse/edge statuses count as blocks even if the
+                // body somehow parses.
+                const httpBlocked =
+                    res &&
+                    (res.status === 429 || res.status === 403 || res.status === 503);
 
                 try {
                     const data = JSON.parse(res.responseText);
@@ -1704,7 +2214,7 @@
                         }
                     } else if (product) {
                         console.warn(
-                            "[WishlistMinPrice] Discarded dubious match:",
+                            "[WMP] Discarded dubious match:",
                             gameName,
                             "->",
                             product.name,
@@ -1712,14 +2222,24 @@
                         );
                     }
                     // Valid JSON, with or without a match: conclusive, no early retry.
-                    conclusive = true;
+                    conclusive = !httpBlocked;
+                    if (httpBlocked) {
+                        console.warn(
+                            `[WMP] AKS refused with HTTP ${res.status} for`,
+                            gameName,
+                            "- probably rate-limited, will retry in a few minutes",
+                        );
+                    }
                 } catch (e) {
                     console.warn(
-                        "[WishlistMinPrice] Response is not valid JSON for",
+                        "[WMP] Response is not valid JSON for",
                         gameName,
                         "- probably a temporary block/rate-limit, will retry in a few minutes",
                     );
                 }
+                // Healthy responses reset the block streak; blocks accumulate
+                // toward a queue-wide cooldown pause (see noteAksResult).
+                noteAksResult(!conclusive, gameName);
 
                 const existing = store[appid] || {};
                 store[appid] = {
@@ -1727,23 +2247,47 @@
                     aksTs: Date.now(),
                     aksStatus: conclusive ? "ok" : "error",
                 };
+                // Name corrected mid-flight and still no AKS price: the query
+                // above used the stale name, so retry once with the current one.
+                computeRenameRetry();
                 persistStore();
             },
             onerror: function (err) {
                 console.warn(
-                    "[WishlistMinPrice] Network error querying AllKeyShop for",
+                    "[WMP] Network error querying AllKeyShop for",
                     gameName,
                     "- will retry in a few minutes",
                     err,
                 );
-                const existing = store[appid] || {};
-                store[appid] = { ...existing, aksTs: Date.now(), aksStatus: "error" };
-                persistStore();
+                if (gen === resetGeneration) {
+                    const existing = store[appid] || {};
+                    store[appid] = { ...existing, aksTs: Date.now(), aksStatus: "error" };
+                    computeRenameRetry();
+                    persistStore();
+                    // Refused/dropped connections count toward the block
+                    // streak too — a throttling endpoint fails this way as well.
+                    noteAksResult(true, gameName);
+                }
+                // finish() here too: some managers skip onloadend on error.
+                finish();
+            },
+            ontimeout: function () {
+                console.warn(
+                    "[WMP] AllKeyShop timeout for",
+                    gameName,
+                    "- will retry in a few minutes",
+                );
+                if (gen === resetGeneration) {
+                    const existing = store[appid] || {};
+                    store[appid] = { ...existing, aksTs: Date.now(), aksStatus: "error" };
+                    computeRenameRetry();
+                    persistStore();
+                    noteAksResult(true, gameName);
+                }
+                finish();
             },
             onloadend: function () {
-                pendingAksFetch.delete(appid);
-                aksQueueBusy = false;
-                setTimeout(processAksQueue, AKS_REQUEST_DELAY_MS);
+                finish();
             },
         });
     }
@@ -1761,6 +2305,13 @@
             if (!info) return;
 
             const { appid, name } = info;
+            // API mode: ignore panels for games outside the wishlist.
+            // Non-wishlist cards (recommendations, popular strips) share the
+            // div.Panel markup; without this they inject phantom entries
+            // with phantom prices into the store and totals.
+            if (apiMode && knownWishlistIds.size > 0 && !knownWishlistIds.has(appid)) {
+                return;
+            }
             sessionSeenIds.add(appid);
 
             const update = {};
@@ -1855,12 +2406,7 @@
         // DOM capture never blocks on the queue; the name is already
         // stored, so the lookup can't go out with an empty search_name.
         namedGames.forEach(({ appid, name }) => {
-            const entry = store[appid];
-            const retryWindow =
-                entry && entry.aksStatus === "error" ? AKS_ERROR_RETRY_MS : MAX_AGE_MS;
-            const aksIsStale =
-                !entry || !entry.aksTs || Date.now() - entry.aksTs > retryWindow;
-            if (aksIsStale) queueAksFetch(appid, name);
+            if (isAksStale(store[appid])) queueAksFetch(appid, name);
         });
     }
 
@@ -2038,14 +2584,14 @@
             minLabel.appendChild(minLabelText);
 
             // Small reset button so the cache can be cleared without the console.
-            // Left click: reloads the page (clean, verified refresh path).
-            // Middle click (auxclick): refresh in place.
+            // Left click: refresh in place, then reload once when finished.
+            // Middle click (auxclick): refresh in place, no reload after.
             const resetBtn = document.createElement("button");
             resetBtn.type = "button";
             resetBtn.className = "tm-min-reset";
             resetBtn.textContent = "⟲";
             resetBtn.title =
-                "Refresh prices (reloads the page; middle-click refreshes in place)";
+                "Refresh prices (reloads once when finished; middle-click refreshes in place without reload)";
             resetBtn.setAttribute("aria-label", "Clear cached prices");
             const doReset = (e, mode) => {
                 e.stopPropagation();
@@ -2057,7 +2603,7 @@
                         )
                         : confirm("Clear the prices and query again? Game names are kept.");
                 if (ok) {
-                    console.log("[WishlistMinPrice] Reset clicked");
+                    console.log("[WMP] Reset clicked");
                     resetCache({ reload: mode !== "inplace" });
                 }
             };
@@ -2149,14 +2695,36 @@
     let scanTimeout = null;
     const scanObserver = new MutationObserver(() => {
         clearTimeout(scanTimeout);
-        scanTimeout = setTimeout(scanVisiblePanels, 100);
+        scanTimeout = setTimeout(() => {
+            scanTimeout = null;
+            scanVisiblePanels();
+        }, 100);
     });
 
     let injectTimeout = null;
     const injectObserver = new MutationObserver(() => {
         clearTimeout(injectTimeout);
-        injectTimeout = setTimeout(tryInject, 50);
+        injectTimeout = setTimeout(() => {
+            injectTimeout = null;
+            tryInject();
+        }, 50);
     });
+
+    // Test-only: park the scan debounce as pending (simulates ceaseless DOM
+    // churn from other extensions on the Steam page). Regression guard for
+    // the bug where queuesBusy() gated the final reload on scanTimeout: with
+    // the debounce stuck pending, the final reload was postponed forever.
+    // holdMs=0 parks it for 1h (worst case); the timer is cleared on next
+    // real observer/reset activity and never survives process exit.
+    unsafeWindow.__wishlistMinPriceTestSimulateMutation = function (holdMs = 0) {
+        clearTimeout(scanTimeout);
+        scanTimeout = setTimeout(
+            () => {
+                scanTimeout = null;
+            },
+            holdMs > 0 ? holdMs : 3600000,
+        );
+    };
 
     // DOM-scraping fallback; only started if the Steam API fails (private
     // wishlist, timeout) or there's no steamid.
@@ -2172,6 +2740,43 @@
         storageKey = getStorageKey(steamid);
         loadStore();
         log(`v${SCRIPT_VERSION} ready (key=${storageKey}, entries=${Object.keys(store).length})`);
+
+        // Fresh page after a reset: resume the one-shot final reload. It
+        // fires once after QUIESCENCE_MS of no persisted changes with empty
+        // queues, then disarms itself.
+        // Stale flags (crash before disarm) are ignored via timestamp expiry
+        // in readAutoReloadFlag; a sibling tab consuming the flag first makes
+        // this tab stand down (see checkQuiescenceAndReload re-check).
+        if (steamid && !autoReloadFired) {
+            if (readAutoReloadFlag(steamid) !== null) {
+                autoReloadArmed = true;
+                lastPriceChangeTs = Date.now();
+                log(
+                    `auto-reload resumed from reset (final reload after ${QUIESCENCE_MS}ms quiet)`,
+                );
+                // Entries rate-limited in the previous pass (aksStatus:error)
+                // get one immediate retry: this page load is a fresh rate
+                // window, while their 5min error backoff would otherwise skip
+                // them until long after the final reload. Conclusive results
+                // (products:[] etc.) are untouched.
+                let errorRetried = 0;
+                Object.values(store).forEach((entry) => {
+                    if (entry && entry.aksStatus === "error" && entry.aksTs) {
+                        delete entry.aksTs;
+                        delete entry.aksStatus;
+                        errorRetried++;
+                    }
+                });
+                if (errorRetried > 0) {
+                    persistStore();
+                    log(
+                        `auto-reload: retrying ${errorRetried} rate-limited AKS entries in fresh window`,
+                    );
+                }
+                scheduleQuiescenceCheck();
+                refreshAutoReloadWatchdog(steamid);
+            }
+        }
 
         let migrated = false;
         Object.keys(store).forEach((id) => {
@@ -2190,12 +2795,12 @@
         if (migrated) persistStore();
 
         // Injection observer is common to both modes: reacts to DOM changes
-        // (e.g. Steam's controls bar appearing).
+        // (e.g. Steam's controls bar appearing). childList+subtree only:
+        // characterData churn on a React page would wake us constantly.
         ensureStyles();
         injectObserver.observe(document.body, {
             childList: true,
             subtree: true,
-            characterData: true,
         });
 
         // Passive panel capture (no scrolling). IStoreBrowseService already provides
@@ -2204,7 +2809,6 @@
         scanObserver.observe(document.body, {
             childList: true,
             subtree: true,
-            characterData: true,
         });
 
         if (steamid) {
