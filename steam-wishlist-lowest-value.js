@@ -135,7 +135,7 @@
     let resetGeneration = 0;
 
     // ---------- Diagnostics ----------
-    // All diagnostic output uses the [WMP] prefix so it can be filtered in
+    // All diagnostic output uses the [SWLV] prefix so it can be filtered in
     // the console. domSnapshot is session-only and never persisted: what
     // each scanned panel actually rendered (price tag, discount badge) —
     // the same ground truth AugmentedSteam counts from.
@@ -146,7 +146,7 @@
     const domSnapshot = new Map(); // appid -> { tag, badge, seen }
     let verboseCapture = false;
     function log(...args) {
-        console.log("[WMP]", ...args);
+        console.log("[SWLV]", ...args);
     }
 
     // ---------- Cache loading ----------
@@ -170,7 +170,7 @@
         try {
             GM_setValue(storageKey, JSON.stringify(store));
         } catch (e) {
-            console.warn("[WMP] Could not save the cache", e);
+            console.warn("[SWLV] Could not save the cache", e);
         }
         // Any persisted mutation pushes the "end of refresh" further out.
         notePriceActivity();
@@ -755,7 +755,7 @@
         const appids = Object.keys(merged);
         if (appids.length === 0) {
             log("compare: got no appid-keyed data — raw sample:");
-            console.log("[WMP] raw sample:", merged);
+            console.log("[SWLV] raw sample:", merged);
             return null;
         }
         log("compare: sample entry →", JSON.stringify(merged[appids[0]]));
@@ -1547,7 +1547,7 @@
                         const items = decodeGetItemsResponse(buf);
                         resolve({ ok: true, items });
                     } catch (e) {
-                        console.warn("[WMP] StoreBrowse decode failed", e);
+                        console.warn("[SWLV] StoreBrowse decode failed", e);
                         resolve({ ok: false, error: "decode" });
                     }
                 },
@@ -1698,7 +1698,7 @@
                             json = JSON.parse(res.responseText);
                         } catch (e) {
                             console.warn(
-                                "[WMP] Non-JSON response from Steam:",
+                                "[SWLV] Non-JSON response from Steam:",
                                 url,
                             );
                         }
@@ -1712,7 +1712,7 @@
                     },
                     onerror: function (err) {
                         console.warn(
-                            "[WMP] Network error with Steam:",
+                            "[SWLV] Network error with Steam:",
                             url,
                             err,
                         );
@@ -1723,7 +1723,7 @@
                         }
                     },
                     ontimeout: function () {
-                        console.warn("[WMP] Steam timeout:", url);
+                        console.warn("[SWLV] Steam timeout:", url);
                         if (remaining > 0) {
                             setTimeout(() => attempt(remaining - 1), STEAM_RETRY_DELAY_MS);
                         } else {
@@ -1971,7 +1971,7 @@
                     }) || changed;
             }
         } else {
-            console.warn("[WMP] No Steam basic data for", appid);
+            console.warn("[SWLV] No Steam basic data for", appid);
         }
 
         pendingNameFetch.delete(appid);
@@ -1991,7 +1991,7 @@
         const items = await fetchWishlist(steamid);
         if (!items) {
             console.warn(
-                "[WMP] Could not read the wishlist via the API " +
+                "[SWLV] Could not read the wishlist via the API " +
                 "(private wishlist or timeout?), falling back to DOM mode",
             );
             domCaptureSuppressed = false;
@@ -2168,9 +2168,9 @@
         };
         const url = buildAksUrl(gameName);
         if (verboseCapture) {
-            console.debug("[WMP] Querying AllKeyShop:", gameName, "\n", url);
+            console.debug("[SWLV] Querying AllKeyShop:", gameName, "\n", url);
         } else {
-            console.debug("[WMP] Querying AllKeyShop:", gameName);
+            console.debug("[SWLV] Querying AllKeyShop:", gameName);
         }
 
         GM_xmlhttpRequest({
@@ -2214,7 +2214,7 @@
                         }
                     } else if (product) {
                         console.warn(
-                            "[WMP] Discarded dubious match:",
+                            "[SWLV] Discarded dubious match:",
                             gameName,
                             "->",
                             product.name,
@@ -2225,14 +2225,14 @@
                     conclusive = !httpBlocked;
                     if (httpBlocked) {
                         console.warn(
-                            `[WMP] AKS refused with HTTP ${res.status} for`,
+                            `[SWLV] AKS refused with HTTP ${res.status} for`,
                             gameName,
                             "- probably rate-limited, will retry in a few minutes",
                         );
                     }
                 } catch (e) {
                     console.warn(
-                        "[WMP] Response is not valid JSON for",
+                        "[SWLV] Response is not valid JSON for",
                         gameName,
                         "- probably a temporary block/rate-limit, will retry in a few minutes",
                     );
@@ -2254,7 +2254,7 @@
             },
             onerror: function (err) {
                 console.warn(
-                    "[WMP] Network error querying AllKeyShop for",
+                    "[SWLV] Network error querying AllKeyShop for",
                     gameName,
                     "- will retry in a few minutes",
                     err,
@@ -2273,7 +2273,7 @@
             },
             ontimeout: function () {
                 console.warn(
-                    "[WMP] AllKeyShop timeout for",
+                    "[SWLV] AllKeyShop timeout for",
                     gameName,
                     "- will retry in a few minutes",
                 );
@@ -2603,7 +2603,7 @@
                         )
                         : confirm("Clear the prices and query again? Game names are kept.");
                 if (ok) {
-                    console.log("[WMP] Reset clicked");
+                    console.log("[SWLV] Reset clicked");
                     resetCache({ reload: mode !== "inplace" });
                 }
             };
